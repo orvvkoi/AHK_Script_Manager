@@ -1,4 +1,4 @@
-name: Build AHK Script Manager v3.3.2 EXE
+name: Build AHK Script Manager v3.4.0 EXE
 
 on:
   workflow_dispatch:
@@ -58,7 +58,7 @@ jobs:
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AHKScriptManager-v3.3.2-win-x64
+          name: AHKScriptManager-v3.4.0-win-x64
           path: AHKScriptManager-win-x64.zip
           if-no-files-found: error
           retention-days: 30
