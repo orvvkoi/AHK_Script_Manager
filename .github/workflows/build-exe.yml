@@ -1,10 +1,23 @@
-name: Build AHK Script Manager EXE
+name: Build AHK Script Manager v3.0 EXE
 
 on:
   workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Windows x64 EXE
     runs-on: windows-latest
 
     steps:
@@ -14,24 +27,39 @@ jobs:
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: '8.0.x'
 
-      - name: Publish EXE
-        run: dotnet publish src/AHKScriptManager.csproj -c Release -r win-x64 --self-contained true
+      - name: Restore
+        run: dotnet restore src/AHKScriptManager.csproj
 
-      - name: Create ZIP
+      - name: Publish optimized self-contained EXE
+        shell: pwsh
+        run: >-
+          dotnet publish src/AHKScriptManager.csproj
+          -c ${{ inputs.configuration }}
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:EnableCompressionInSingleFile=true
+          -p:PublishTrimmed=false
+          -p:TrimMode=partial
+          -p:InvariantGlobalization=true
+          -o publish
+
+      - name: Prepare portable package
         shell: pwsh
         run: |
-          $publish = "src/bin/Release/net8.0-windows/win-x64/publish"
-          $output = "AHKScriptManager-win-x64.zip"
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item publish/AHKScriptManager.exe package/AHKScriptManager.exe
+          Copy-Item README.txt package/README.txt
+          if (-not (Test-Path package/AHKScriptManager.exe)) { throw "EXE output not found" }
+          if ((Get-Item package/AHKScriptManager.exe).Length -lt 1000000) { throw "EXE output looks invalid" }
+          Compress-Archive -Path package/* -DestinationPath AHKScriptManager-win-x64.zip -Force
 
-          Compress-Archive `
-            -Path "$publish/*" `
-            -DestinationPath $output `
-            -Force
-
-      - name: Upload EXE Artifact
+      - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AHKScriptManager-win-x64
+          name: AHKScriptManager-v3.0-win-x64
           path: AHKScriptManager-win-x64.zip
+          if-no-files-found: error
+          retention-days: 30
