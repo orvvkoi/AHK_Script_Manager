@@ -5,7 +5,7 @@ using Microsoft.Win32;
 
 namespace AHKScriptManager;
 
-public enum RestartReason { None, Crash, FileChanged, TargetStarted, Profile }
+public enum RestartReason { None, Crash, FileChanged, TargetStarted, Profile, Manual }
 
 static class ConfigSchema
 {
@@ -57,6 +57,7 @@ public sealed class ScriptItem
     [System.Text.Json.Serialization.JsonIgnore] public DateTime? FileRestartCooldownUntilUtc { get; set; }
     [System.Text.Json.Serialization.JsonIgnore] public RestartReason RestartReason { get; set; }
     [System.Text.Json.Serialization.JsonIgnore] public List<DateTime> RestartHistoryUtc { get; } = new();
+    [System.Text.Json.Serialization.JsonIgnore] public HashSet<string> ActiveProfileIds { get; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed class ProfileItem
@@ -68,6 +69,7 @@ public sealed class ProfileItem
     public int StopDelayMs { get; set; } = 200;
     public string StartHotkey { get; set; } = "";
     public string StopHotkey { get; set; } = "";
+    public override string ToString() => Name;
 }
 
 public sealed class AppConfig
@@ -98,6 +100,10 @@ public sealed class MainForm : Form
     readonly ListBox profiles = new();
     readonly TextBox search = new();
     readonly TextBox logBox = new();
+    readonly TextBox scriptDetails = new();
+    readonly Label statusLabel = new();
+    string lastScriptUiSignature = "";
+    string lastProfileUiSignature = "";
     readonly NotifyIcon tray = new();
     readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
     readonly Dictionary<int, Action> hotkeys = new();
@@ -112,13 +118,15 @@ public sealed class MainForm : Form
     readonly Dictionary<string, ProfileRunState> profileStates = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, CancellationTokenSource> profileCancellation = new(StringComparer.OrdinalIgnoreCase);
     bool futureConfigVersion;
+    string? contextScriptId;
 
     public MainForm()
     {
         bool created;
         singleInstanceMutex = new Mutex(true, @"Global\AHKScriptManager_v2", out created);
         if (!created) { MessageBox.Show("AHK Script Manager가 이미 실행 중입니다.", "AHK Script Manager", MessageBoxButtons.OK, MessageBoxIcon.Information); Environment.Exit(0); }
-        Text = "AHK Script Manager v3.0"; Width = 1180; Height = 720;
+        Text = "AHK Script Manager v3.2"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
+        AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         AllowDrop = true;
         DragEnter += OnDragEnter; DragDrop += OnDragDrop;
@@ -142,8 +150,8 @@ public sealed class MainForm : Form
 
     void BuildUi()
     {
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(6) };
-        search.Width = 220; search.PlaceholderText = "🔍 스크립트 검색"; search.TextChanged += (_, _) => RefreshScripts();
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46, Padding = new Padding(8), WrapContents = false, BackColor = Color.FromArgb(245,246,248) };
+        search.Width = 250; search.PlaceholderText = "🔍 스크립트 검색"; search.TextChanged += (_, _) => RefreshScripts(true);
         top.Controls.Add(search);
         top.Controls.Add(Btn("＋ 등록", (_,_) => AddScript()));
         top.Controls.Add(Btn("📂 폴더", (_,_) => AddFolder()));
@@ -157,24 +165,62 @@ public sealed class MainForm : Form
         var t1 = new TabPage("스크립트"); var t2 = new TabPage("프로필"); var t3 = new TabPage("로그"); var t4 = new TabPage("설정");
         BuildScriptTab(t1); BuildProfileTab(t2); BuildLogTab(t3); BuildSettingsTab(t4);
         tabs.TabPages.AddRange(new[] { t1,t2,t3,t4 });
-        Controls.Add(tabs); Controls.Add(top);
+        statusLabel.AutoSize = true; statusLabel.Text = "준비됨"; statusLabel.Dock = DockStyle.Bottom; statusLabel.Height = 24; statusLabel.Padding = new Padding(8,4,0,0); statusLabel.BackColor = Color.FromArgb(245,246,248); statusLabel.ForeColor = Color.FromArgb(90,94,100);
+        Controls.Add(statusLabel); Controls.Add(tabs); Controls.Add(top);
     }
 
     void BuildScriptTab(TabPage tab)
     {
-        scripts.Dock = DockStyle.Fill; scripts.View = View.Details; scripts.FullRowSelect = true; scripts.GridLines = true; scripts.MultiSelect = false;
+        var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 390, FixedPanel = FixedPanel.Panel2 };
+        scripts.Dock = DockStyle.Fill;
+        scripts.View = View.Details; scripts.FullRowSelect = true; scripts.GridLines = false; scripts.MultiSelect = false;
+        scripts.HideSelection = false; scripts.BorderStyle = BorderStyle.None; scripts.Font = new Font("Segoe UI", 9F);
+        scripts.BackColor = Color.White; scripts.ForeColor = Color.FromArgb(35, 38, 42);
+        scripts.HeaderStyle = ColumnHeaderStyle.Nonclickable;
         foreach (var x in new[] { ("상태",80),("이름",180),("그룹",110),("AHK",70),("PID",70),("시작",125),("종료",125),("대상 프로세스",150),("경로",430) }) scripts.Columns.Add(x.Item1,x.Item2);
         scripts.DoubleClick += (_,_) => EditSelected();
-        scripts.MouseDown += (_, e) => { if (e.Button == MouseButtons.Right) { var hit = scripts.HitTest(e.Location); if (hit.Item != null) { hit.Item.Selected = true; hit.Item.Focused = true; } } };
-        var menu = new ContextMenuStrip(); menu.Items.Add("실행", null, (_,_) => RunSelected()); menu.Items.Add("종료", null, (_,_) => StopSelected()); menu.Items.Add("재시작", null, (_,_) => { StopSelected(); RunSelected(); }); menu.Items.Add("편집", null, (_,_) => EditSelected()); menu.Items.Add("백업", null, (_,_) => BackupSelected()); menu.Items.Add("제거", null, (_,_) => RemoveSelected()); scripts.ContextMenuStrip = menu;
-        tab.Controls.Add(scripts); RefreshScripts();
+        scripts.SelectedIndexChanged += (_,_) => UpdateScriptDetails();
+        scripts.MouseDown += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            var hit = scripts.HitTest(e.Location);
+            if (hit.Item == null) { contextScriptId = null; scripts.SelectedItems.Clear(); UpdateScriptDetails(); return; }
+            hit.Item.Selected = true; hit.Item.Focused = true; contextScriptId = (hit.Item.Tag as ScriptItem)?.Id;
+        };
+        var menu = new ContextMenuStrip { ShowImageMargin = false };
+        var runItem = menu.Items.Add("▶ 실행", null, (_,_) => RunContextSelected());
+        var stopItem = menu.Items.Add("■ 종료", null, (_,_) => StopContextSelected());
+        var restartItem = menu.Items.Add("↻ 재시작", null, (_,_) => RestartContextSelected());
+        menu.Items.Add(new ToolStripSeparator());
+        var editItem = menu.Items.Add("✎ 편집", null, (_,_) => EditContextSelected());
+        var backupItem = menu.Items.Add("▣ 백업", null, (_,_) => BackupContextSelected());
+        var removeItem = menu.Items.Add("× 제거", null, (_,_) => RemoveContextSelected());
+        menu.Opening += (_,_) => { var x = GetContextSelected(); bool ok = x != null; runItem.Enabled = stopItem.Enabled = restartItem.Enabled = editItem.Enabled = backupItem.Enabled = removeItem.Enabled = ok; };
+        scripts.ContextMenuStrip = menu;
+
+        scriptDetails.Dock = DockStyle.Fill; scriptDetails.Multiline = true; scriptDetails.ReadOnly = true; scriptDetails.BorderStyle = BorderStyle.None;
+        scriptDetails.BackColor = Color.FromArgb(248,249,250); scriptDetails.ForeColor = Color.FromArgb(55,58,62); scriptDetails.Font = new Font("Segoe UI", 9F); scriptDetails.Padding = new Padding(8);
+        split.Panel1.Controls.Add(scripts); split.Panel2.Padding = new Padding(8); split.Panel2.Controls.Add(scriptDetails);
+        tab.Controls.Add(split); RefreshScripts(true);
+    }
+
+    void UpdateScriptDetails()
+    {
+        var s = Selected();
+        if (s == null) { scriptDetails.Text = "스크립트를 선택하면 상세 정보가 표시됩니다."; return; }
+        string state = s.Pid.HasValue ? "● 실행 중" : (s.Enabled ? "○ 대기" : "× 비활성");
+        scriptDetails.Text = $"{s.Name}    {state}\r\n" +
+            $"AHK: {s.Version}    PID: {(s.Pid?.ToString() ?? "-")}    그룹: {s.Group}\r\n" +
+            $"대상 프로세스: {(string.IsNullOrWhiteSpace(s.TargetProcess) ? "없음" : s.TargetProcess)}\r\n" +
+            $"경로: {s.Path}\r\n" +
+            $"설명: {s.Description}";
     }
 
     void BuildProfileTab(TabPage tab)
     {
-        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 300 };
-        profiles.Dock = DockStyle.Fill; split.Panel1.Controls.Add(profiles);
-        var panel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 300, BackColor = Color.FromArgb(245,246,248) };
+        profiles.Dock = DockStyle.Fill; profiles.BorderStyle = BorderStyle.None; profiles.Font = new Font("Segoe UI", 9.5F); profiles.BackColor = Color.White; profiles.IntegralHeight = false; split.Panel1.Padding = new Padding(8); split.Panel1.BackColor = Color.FromArgb(245,246,248); split.Panel1.Controls.Add(profiles);
+        var panel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16), BackColor = Color.White };
         var name = new TextBox { Left = 10, Top = 28, Width = 250 };
         var start = new TextBox { Left = 275, Top = 28, Width = 150 };
         var stop = new TextBox { Left = 440, Top = 28, Width = 150 };
@@ -200,7 +246,7 @@ public sealed class MainForm : Form
 
     void SaveProfileEditor(TextBox n, TextBox sk, TextBox ek, NumericUpDown sd, NumericUpDown ed, CheckedListBox checks)
     {
-        var p=SelectedProfile(); if(p==null)return; p.Name=n.Text.Trim();p.StartHotkey=sk.Text.Trim();p.StopHotkey=ek.Text.Trim();p.StartDelayMs=(int)sd.Value;p.StopDelayMs=(int)ed.Value;p.ScriptIds=checks.CheckedItems.Cast<ScriptItem>().Select(x=>x.Id).ToList();SaveConfig();RegisterAllHotkeys();RefreshProfiles();Log($"프로필 저장: {p.Name}");
+        var p=SelectedProfile(); if(p==null)return; p.Name=n.Text.Trim();p.StartHotkey=sk.Text.Trim();p.StopHotkey=ek.Text.Trim();p.StartDelayMs=(int)sd.Value;p.StopDelayMs=(int)ed.Value;p.ScriptIds=checks.CheckedItems.Cast<ScriptItem>().Select(x=>x.Id).ToList();SaveConfig();RegisterAllHotkeys();RefreshProfiles(true);Log($"프로필 저장: {p.Name}");
     }
 
     void BuildLogTab(TabPage tab)
@@ -226,17 +272,57 @@ public sealed class MainForm : Form
         p.Controls.Add(save); tab.Controls.Add(p);
     }
 
-    Button Btn(string text, EventHandler e) { var b=new Button{Text=text,Width=105,Height=29};b.Click+=e;return b; }
+    Button Btn(string text, EventHandler e) { var b=new Button{Text=text,Width=105,Height=30,FlatStyle=FlatStyle.System,Margin=new Padding(3)};b.Click+=e;return b; }
 
-    void AddScript(){using var d=new OpenFileDialog{Filter="AutoHotkey (*.ahk)|*.ahk",Multiselect=true};if(d.ShowDialog()!=DialogResult.OK)return;foreach(var p in d.FileNames)Register(p);SaveConfig();RefreshScripts();}
-    void AddFolder(){using var d=new FolderBrowserDialog();if(d.ShowDialog()!=DialogResult.OK)return;SafeRegisterFolder(d.SelectedPath);SaveConfig();RefreshScripts();}
+    void AddScript(){using var d=new OpenFileDialog{Filter="AutoHotkey (*.ahk)|*.ahk",Multiselect=true};if(d.ShowDialog()!=DialogResult.OK)return;foreach(var p in d.FileNames)Register(p);SaveConfig();RefreshScripts(true);}
+    void AddFolder(){using var d=new FolderBrowserDialog();if(d.ShowDialog()!=DialogResult.OK)return;SafeRegisterFolder(d.SelectedPath);SaveConfig();RefreshScripts(true);}
     void SafeRegisterFolder(string dir){try{foreach(var p in Directory.EnumerateFiles(dir,"*.ahk",SearchOption.AllDirectories))Register(p);}catch(Exception ex){Log($"폴더 등록 일부 실패: {dir} / {ex.Message}");}}
     void Register(string path){path=Path.GetFullPath(path);if(cfg.Scripts.Any(s=>s.Path.Equals(path,StringComparison.OrdinalIgnoreCase)))return;cfg.Scripts.Add(new ScriptItem{Name=Path.GetFileNameWithoutExtension(path),Path=path,Version=DetectVersion(path),WorkingDirectory=Path.GetDirectoryName(path)??""});Log($"등록: {path}");}
     string DetectVersion(string path){try{using var r=new StreamReader(path);char[] b=new char[32768];int n=r.ReadBlock(b,0,b.Length);var s=new string(b,0,n);if(s.Contains("#Requires AutoHotkey v2",StringComparison.OrdinalIgnoreCase))return "v2";if(s.Contains("#Requires AutoHotkey v1",StringComparison.OrdinalIgnoreCase))return "v1";}catch{}return "Auto";}
     ScriptItem? Selected(){return scripts.SelectedItems.Count==0?null:scripts.SelectedItems[0].Tag as ScriptItem;}
 
-    void RefreshScripts(){var q=search.Text.Trim();scripts.BeginUpdate();scripts.Items.Clear();foreach(var s in cfg.Scripts.Where(s=>q==""||s.Name.Contains(q,StringComparison.OrdinalIgnoreCase)||s.Group.Contains(q,StringComparison.OrdinalIgnoreCase))){RefreshPid(s);var i=new ListViewItem(s.Pid.HasValue?"● 실행":(s.Enabled?"○ 정지":"× 비활성")){Tag=s};i.SubItems.Add(s.Name);i.SubItems.Add(s.Group);i.SubItems.Add(s.Version);i.SubItems.Add(s.Pid?.ToString()??"-");i.SubItems.Add(s.StartHotkey);i.SubItems.Add(s.StopHotkey);i.SubItems.Add(s.TargetProcess);i.SubItems.Add(s.Path);scripts.Items.Add(i);}scripts.EndUpdate();}
-    void RefreshProfiles(){profiles.Items.Clear();foreach(var p in cfg.Profiles)profiles.Items.Add(p.Name);}
+    void RefreshScripts(bool force = false)
+    {
+        var q = search.Text.Trim();
+        foreach (var s in cfg.Scripts) RefreshPid(s);
+        var visible = cfg.Scripts.Where(s => q == "" || s.Name.Contains(q,StringComparison.OrdinalIgnoreCase) || s.Group.Contains(q,StringComparison.OrdinalIgnoreCase)).ToList();
+        var signature = string.Join("|", visible.Select(s => $"{s.Id}:{s.Pid}:{s.Enabled}:{s.Version}:{s.StartHotkey}:{s.StopHotkey}:{s.TargetProcess}:{s.Path}"));
+        if (!force && signature == lastScriptUiSignature) { UpdateScriptDetails(); return; }
+        string? keepId = contextScriptId ?? (scripts.SelectedItems.Count > 0 ? (scripts.SelectedItems[0].Tag as ScriptItem)?.Id : null);
+        lastScriptUiSignature = signature;
+        scripts.BeginUpdate();
+        try
+        {
+            scripts.Items.Clear();
+            foreach (var s in visible)
+            {
+                var i = new ListViewItem(s.Pid.HasValue ? "● 실행" : (s.Enabled ? "○ 대기" : "× 비활성")) { Tag = s };
+                i.SubItems.Add(s.Name); i.SubItems.Add(s.Group); i.SubItems.Add(s.Version); i.SubItems.Add(s.Pid?.ToString() ?? "-");
+                i.SubItems.Add(s.StartHotkey); i.SubItems.Add(s.StopHotkey); i.SubItems.Add(s.TargetProcess); i.SubItems.Add(s.Path);
+                if (s.Id.Equals(keepId,StringComparison.OrdinalIgnoreCase)) i.Selected = true;
+                scripts.Items.Add(i);
+            }
+        }
+        finally { scripts.EndUpdate(); }
+        UpdateScriptDetails(); UpdateStatusLabel();
+    }
+
+    void RefreshProfiles(bool force = false)
+    {
+        var signature = string.Join("|", cfg.Profiles.Select(p => $"{p.Id}:{p.Name}:{p.ScriptIds.Count}"));
+        if (!force && signature == lastProfileUiSignature) return;
+        string? keepId = SelectedProfile()?.Id; lastProfileUiSignature = signature;
+        profiles.BeginUpdate();
+        try { profiles.Items.Clear(); foreach (var p in cfg.Profiles) { int index = profiles.Items.Add(p); if (p.Id.Equals(keepId,StringComparison.OrdinalIgnoreCase)) profiles.SelectedIndex = index; } }
+        finally { profiles.EndUpdate(); }
+        UpdateStatusLabel();
+    }
+
+    void UpdateStatusLabel()
+    {
+        int running = cfg.Scripts.Count(x => x.Pid.HasValue);
+        statusLabel.Text = $"스크립트 {cfg.Scripts.Count}개  ·  실행 중 {running}개  ·  프로필 {cfg.Profiles.Count}개";
+    }
     void RefreshPid(ScriptItem s)
     {
         if (!s.Pid.HasValue) return;
@@ -351,6 +437,7 @@ public sealed class MainForm : Form
     {
         s.DesiredRunning=false;
         s.ManualOverride=false;
+        s.ActiveProfileIds.Clear();
         s.RestartPending=false;
         s.RestartReason=RestartReason.None;
         RefreshPid(s);
@@ -363,7 +450,7 @@ public sealed class MainForm : Form
             Log($"종료: {s.Name} PID={pid}");
         }
         catch(Exception ex){Log($"종료 오류: {s.Name} / {ex.Message}");}
-        finally{ClearRuntimeProcessState(s);SaveConfig();RefreshScripts();}
+        finally{ClearRuntimeProcessState(s);SaveConfig();RefreshScripts(true);}
     }
 
     string ResolveAhk(ScriptItem s)
@@ -438,7 +525,9 @@ public sealed class MainForm : Form
                 }
             }
         }
-        RefreshScripts();
+        RefreshScripts(false);
+        RefreshProfiles(false);
+        UpdateStatusLabel();
     }
 
     void PruneRestartHistory(ScriptItem s)
@@ -449,14 +538,14 @@ public sealed class MainForm : Form
         s.RestartCount=s.RestartHistoryUtc.Count;
     }
 
-    void AddProfile(){string name=Prompt("프로필 이름","새 프로필");if(string.IsNullOrWhiteSpace(name))return;cfg.Profiles.Add(new ProfileItem{Name=name,ScriptIds=cfg.Scripts.Select(s=>s.Id).ToList()});SaveConfig();RefreshProfiles();}
-    ProfileItem? SelectedProfile(){return profiles.SelectedIndex<0?null:cfg.Profiles.ElementAtOrDefault(profiles.SelectedIndex);}
+    void AddProfile(){string name=Prompt("프로필 이름","새 프로필");if(string.IsNullOrWhiteSpace(name))return;cfg.Profiles.Add(new ProfileItem{Name=name,ScriptIds=cfg.Scripts.Select(s=>s.Id).ToList()});SaveConfig();RegisterAllHotkeys();RefreshProfiles(true);}
+    ProfileItem? SelectedProfile(){return profiles.SelectedItem as ProfileItem;}
     async void RunProfile(){var p=SelectedProfile();if(p==null)return;await RunProfileInternal(p);}
     async void StopProfile(){var p=SelectedProfile();if(p==null)return;await StopProfileInternal(p);}
     async Task RunProfileInternal(ProfileItem p)
     {
         if(!TryBeginProfile(p,ProfileRunState.Starting,out var cts))return;
-        try{foreach(var id in p.ScriptIds){cts.Token.ThrowIfCancellationRequested();var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null){RunScript(s,false,true,RestartReason.Profile);}if(p.StartDelayMs>0)await Task.Delay(p.StartDelayMs,cts.Token);}}
+        try{foreach(var id in p.ScriptIds){cts.Token.ThrowIfCancellationRequested();var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null){s.ActiveProfileIds.Add(p.Id);RunScript(s,false,false,RestartReason.Profile);}if(p.StartDelayMs>0)await Task.Delay(p.StartDelayMs,cts.Token);}}
         catch(OperationCanceledException){Log($"프로필 시작 취소: {p.Name}");}
         finally{EndProfile(p,cts);}
     }
@@ -466,11 +555,11 @@ public sealed class MainForm : Form
         {
             startCts.Cancel();
             Log($"프로필 시작 중지 요청: {p.Name}");
-            foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)StopScript(s);}
+            foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null){s.ActiveProfileIds.Remove(p.Id);if(s.ActiveProfileIds.Count==0&&!s.ManualOverride)StopScript(s);}}
             return;
         }
         if(!TryBeginProfile(p,ProfileRunState.Stopping,out var cts))return;
-        try{foreach(var id in p.ScriptIds){cts.Token.ThrowIfCancellationRequested();var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)StopScript(s);if(p.StopDelayMs>0)await Task.Delay(p.StopDelayMs,cts.Token);}}
+        try{foreach(var id in p.ScriptIds){cts.Token.ThrowIfCancellationRequested();var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null){s.ActiveProfileIds.Remove(p.Id);if(s.ActiveProfileIds.Count==0&&!s.ManualOverride)StopScript(s);}if(p.StopDelayMs>0)await Task.Delay(p.StopDelayMs,cts.Token);}}
         catch(OperationCanceledException){Log($"프로필 종료 취소: {p.Name}");}
         finally{EndProfile(p,cts);}
     }
@@ -499,17 +588,33 @@ public sealed class MainForm : Form
         foreach(var id in p.ScriptIds)
         {
             var s=cfg.Scripts.FirstOrDefault(x=>x.Id.Equals(id,StringComparison.OrdinalIgnoreCase));
-            if(s!=null)StopScript(s);
+            if(s!=null){s.ActiveProfileIds.Remove(p.Id);if(s.ActiveProfileIds.Count==0&&!s.ManualOverride)StopScript(s);}
         }
         cfg.Profiles.Remove(p);
         profileStates.Remove(p.Id);
         SaveConfig();
-        RefreshProfiles();
+        RegisterAllHotkeys();
+        RefreshProfiles(true);
         Log($"프로필 삭제: {p.Name}");
     }
 
-    void EditSelected(){var s=Selected();if(s==null)return;using var f=new ScriptEditorForm(s);if(f.ShowDialog(this)==DialogResult.OK){SaveConfig();RegisterAllHotkeys();RefreshScripts();Log($"스크립트 설정 저장: {s.Name}");}}
-    void RemoveSelected(){var s=Selected();if(s==null)return;StopScript(s);cfg.Scripts.Remove(s);foreach(var p in cfg.Profiles)p.ScriptIds.RemoveAll(id=>id.Equals(s.Id,StringComparison.OrdinalIgnoreCase));SaveConfig();RegisterAllHotkeys();RefreshScripts();RefreshProfiles();}
+    ScriptItem? GetContextSelected()
+    {
+        if(!string.IsNullOrWhiteSpace(contextScriptId))
+            return cfg.Scripts.FirstOrDefault(x=>x.Id.Equals(contextScriptId,StringComparison.OrdinalIgnoreCase));
+        return Selected();
+    }
+    void RunContextSelected(){var s=GetContextSelected();if(s!=null)RunScript(s,false,true,RestartReason.None);}
+    void StopContextSelected(){var s=GetContextSelected();if(s!=null)StopScript(s);}
+    void RestartContextSelected(){var s=GetContextSelected();if(s==null)return;StopScript(s);RunScript(s,false,true,RestartReason.Manual);}
+    void EditContextSelected(){var s=GetContextSelected();if(s==null)return;EditScript(s);}
+    void BackupContextSelected(){var s=GetContextSelected();if(s!=null)Backup(s);}
+    void RemoveContextSelected(){var s=GetContextSelected();if(s==null)return;contextScriptId=s.Id;RemoveScript(s);}
+
+    void EditSelected(){var s=Selected();if(s==null)return;EditScript(s);}
+    void EditScript(ScriptItem s){using var f=new ScriptEditorForm(s);if(f.ShowDialog(this)==DialogResult.OK){SaveConfig();RegisterAllHotkeys();RefreshScripts(true);Log($"스크립트 설정 저장: {s.Name}");}}
+    void RemoveScript(ScriptItem s){StopScript(s);cfg.Scripts.Remove(s);foreach(var p in cfg.Profiles)p.ScriptIds.RemoveAll(id=>id.Equals(s.Id,StringComparison.OrdinalIgnoreCase));contextScriptId=null;SaveConfig();RegisterAllHotkeys();RefreshScripts(true);RefreshProfiles(true);}
+    void RemoveSelected(){var s=Selected();if(s!=null)RemoveScript(s);}
     void BackupSelected(){var s=Selected();if(s!=null)Backup(s);}
     void BackupScripts(){foreach(var s in cfg.Scripts)Backup(s);Log("전체 백업 완료");}
     void Backup(ScriptItem s){try{if(!File.Exists(s.Path)){Log($"백업 실패: 파일 없음 - {s.Name}");return;}var dir=Path.Combine(Path.GetDirectoryName(configFile)!,"backup",Sanitize(s.Name));Directory.CreateDirectory(dir);var dest=Path.Combine(dir,DateTime.Now.ToString("yyyyMMdd_HHmmss_fff")+"_"+s.Id+".ahk");File.Copy(s.Path,dest,false);Log($"백업 완료: {s.Name}");}catch(Exception ex){Log("백업 오류: "+ex.Message);}}
@@ -519,14 +624,14 @@ public sealed class MainForm : Form
         var m=MessageBox.Show("예 = 내보내기 / 아니오 = 가져오기", "설정 백업", MessageBoxButtons.YesNoCancel);
         if(m==DialogResult.Cancel)return;
         if(m==DialogResult.Yes){using var d=new SaveFileDialog{Filter="JSON (*.json)|*.json",FileName="AHKScriptManager_Backup.json"};if(d.ShowDialog()==DialogResult.OK){SaveConfig();File.Copy(configFile,d.FileName,true);Log("설정 내보내기 완료");}}
-        else {using var d=new OpenFileDialog{Filter="JSON (*.json)|*.json"};if(d.ShowDialog()!=DialogResult.OK)return;try{var x=JsonSerializer.Deserialize(File.ReadAllText(d.FileName), AppJsonContext.Default.AppConfig);if(x==null)throw new Exception("잘못된 설정 파일");cfg.Scripts.Clear();cfg.Profiles.Clear();cfg.Scripts.AddRange(x.Scripts ?? new List<ScriptItem>());cfg.Profiles.AddRange(x.Profiles ?? new List<ProfileItem>());cfg.StartWithWindows=x.StartWithWindows;cfg.StartMinimized=x.StartMinimized;cfg.MinimizeToTray=x.MinimizeToTray;cfg.PortableMode=x.PortableMode;cfg.EmergencyStopHotkey=x.EmergencyStopHotkey;cfg.AhkV1Path=x.AhkV1Path;cfg.AhkV2Path=x.AhkV2Path;cfg.StopScriptsOnManagerExit=x.StopScriptsOnManagerExit;cfg.GracefulStopTimeoutMs=x.GracefulStopTimeoutMs;cfg.SchemaVersion=x.SchemaVersion;futureConfigVersion=false;NormalizeConfig();SaveConfig();ApplyPortableMode();RegisterAllHotkeys();RefreshScripts();RefreshProfiles();Log("설정 가져오기 완료");}catch(Exception ex){MessageBox.Show("가져오기 실패: "+ex.Message);}}
+        else {using var d=new OpenFileDialog{Filter="JSON (*.json)|*.json"};if(d.ShowDialog()!=DialogResult.OK)return;try{var x=JsonSerializer.Deserialize(File.ReadAllText(d.FileName), AppJsonContext.Default.AppConfig);if(x==null)throw new Exception("잘못된 설정 파일");cfg.Scripts.Clear();cfg.Profiles.Clear();cfg.Scripts.AddRange(x.Scripts ?? new List<ScriptItem>());cfg.Profiles.AddRange(x.Profiles ?? new List<ProfileItem>());cfg.StartWithWindows=x.StartWithWindows;cfg.StartMinimized=x.StartMinimized;cfg.MinimizeToTray=x.MinimizeToTray;cfg.PortableMode=x.PortableMode;cfg.EmergencyStopHotkey=x.EmergencyStopHotkey;cfg.AhkV1Path=x.AhkV1Path;cfg.AhkV2Path=x.AhkV2Path;cfg.StopScriptsOnManagerExit=x.StopScriptsOnManagerExit;cfg.GracefulStopTimeoutMs=x.GracefulStopTimeoutMs;cfg.SchemaVersion=x.SchemaVersion;futureConfigVersion=false;NormalizeConfig();SaveConfig();ApplyPortableMode();RegisterAllHotkeys();RefreshScripts(true);RefreshProfiles(true);Log("설정 가져오기 완료");}catch(Exception ex){MessageBox.Show("가져오기 실패: "+ex.Message);}}
     }
 
     void SetupTray(){tray.Icon=SystemIcons.Application;tray.Text="AHK Script Manager";var m=new ContextMenuStrip();m.Items.Add("열기",null,(_,_)=>ShowFromTray());m.Items.Add("전체 실행",null,(_,_)=>RunAll());m.Items.Add("전체 종료",null,(_,_)=>StopAll());m.Items.Add("긴급 종료",null,(_,_)=>EmergencyStop());m.Items.Add("종료",null,(_,_)=>{closing=true;Close();});tray.ContextMenuStrip=m;tray.DoubleClick+=(s,e)=>ShowFromTray();tray.Visible=true;}
     void ShowFromTray(){Show();WindowState=FormWindowState.Normal;Activate();}
     protected override void OnResize(EventArgs e){base.OnResize(e);if(WindowState==FormWindowState.Minimized&&cfg.MinimizeToTray)Hide();}
 
-    void RegisterAllHotkeys(){foreach(var id in hotkeys.Keys.ToList())UnregisterHotKey(Handle,id);hotkeys.Clear();var used=new HashSet<string>(StringComparer.OrdinalIgnoreCase);foreach(var s in cfg.Scripts.Where(x=>x.Enabled)){TryRegister(s.StartHotkey,()=>RunScript(s),used,$"{s.Name} 시작");TryRegister(s.StopHotkey,()=>StopScript(s),used,$"{s.Name} 종료");}TryRegister(cfg.EmergencyStopHotkey,EmergencyStop,used,"긴급 전체 종료");foreach(var p in cfg.Profiles){TryRegister(p.StartHotkey,()=>RunProfileById(p.Id),used,$"프로필 {p.Name} 시작");TryRegister(p.StopHotkey,()=>StopProfileById(p.Id),used,$"프로필 {p.Name} 종료");}}
+    void RegisterAllHotkeys(){foreach(var id in hotkeys.Keys.ToList())UnregisterHotKey(Handle,id);hotkeys.Clear();nextHotkeyId=100;var used=new HashSet<string>(StringComparer.OrdinalIgnoreCase);foreach(var s in cfg.Scripts.Where(x=>x.Enabled)){TryRegister(s.StartHotkey,()=>RunScript(s),used,$"{s.Name} 시작");TryRegister(s.StopHotkey,()=>StopScript(s),used,$"{s.Name} 종료");}TryRegister(cfg.EmergencyStopHotkey,EmergencyStop,used,"긴급 전체 종료");foreach(var p in cfg.Profiles){TryRegister(p.StartHotkey,()=>RunProfileById(p.Id),used,$"프로필 {p.Name} 시작");TryRegister(p.StopHotkey,()=>StopProfileById(p.Id),used,$"프로필 {p.Name} 종료");}}
     async void RunProfileById(string id){var p=cfg.Profiles.FirstOrDefault(x=>x.Id.Equals(id,StringComparison.OrdinalIgnoreCase));if(p==null)return;await RunProfileInternal(p);}
     async void StopProfileById(string id){var p=cfg.Profiles.FirstOrDefault(x=>x.Id.Equals(id,StringComparison.OrdinalIgnoreCase));if(p==null)return;await StopProfileInternal(p);}
     void TryRegister(string text,Action action,HashSet<string> used,string owner){if(string.IsNullOrWhiteSpace(text))return;if(!ParseHotkey(text,out var mod,out var vk)){Log($"지원하지 않는 단축키: {text} / {owner}");return;}string key=$"{mod}:{vk}";if(!used.Add(key)){Log($"단축키 충돌: {text} / {owner}");return;}int id=nextHotkeyId++;if(RegisterHotKey(Handle,id,mod,vk))hotkeys[id]=action;else Log($"단축키 등록 실패: {text} / {owner}");}
@@ -678,7 +783,7 @@ public sealed class MainForm : Form
     }
     void Log(string msg){string line=$"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {msg}";try{File.AppendAllText(Path.Combine(logDir,DateTime.Now.ToString("yyyy-MM-dd")+".log"),line+Environment.NewLine);}catch{}if(!IsDisposed){try{if(logBox.InvokeRequired)logBox.BeginInvoke(()=>logBox.AppendText(line+Environment.NewLine));else logBox.AppendText(line+Environment.NewLine);}catch{}}}
     void OnDragEnter(object? s,DragEventArgs e){e.Effect=e.Data?.GetDataPresent(DataFormats.FileDrop)==true?DragDropEffects.Copy:DragDropEffects.None;}
-    void OnDragDrop(object? s,DragEventArgs e){if(e.Data?.GetData(DataFormats.FileDrop) is string[] a){foreach(var p in a){if(File.Exists(p)&&Path.GetExtension(p).Equals(".ahk",StringComparison.OrdinalIgnoreCase))Register(p);else if(Directory.Exists(p))SafeRegisterFolder(p);}SaveConfig();RefreshScripts();RegisterAllHotkeys();}}
+    void OnDragDrop(object? s,DragEventArgs e){if(e.Data?.GetData(DataFormats.FileDrop) is string[] a){foreach(var p in a){if(File.Exists(p)&&Path.GetExtension(p).Equals(".ahk",StringComparison.OrdinalIgnoreCase))Register(p);else if(Directory.Exists(p))SafeRegisterFolder(p);}SaveConfig();RefreshScripts(true);RegisterAllHotkeys();}}
     static string Prompt(string title,string value){using var f=new Form{Width=420,Height=140,Text=title,StartPosition=FormStartPosition.CenterParent};var t=new TextBox{Left=15,Top=15,Width=370,Text=value};var b=new Button{Text="확인",Left=300,Top=50,DialogResult=DialogResult.OK};f.Controls.Add(t);f.Controls.Add(b);f.AcceptButton=b;return f.ShowDialog()==DialogResult.OK?t.Text:"";}
     protected override void OnFormClosing(FormClosingEventArgs e){if(!closing&&cfg.MinimizeToTray&&e.CloseReason!=CloseReason.WindowsShutDown&&e.CloseReason!=CloseReason.TaskManagerClosing){e.Cancel=true;Hide();return;}closing=true;foreach(var cts in profileCancellation.Values.ToList()){try{cts.Cancel();}catch{}}foreach(var id in hotkeys.Keys.ToList())UnregisterHotKey(Handle,id);tray.Visible=false;if(cfg.StopScriptsOnManagerExit){foreach(var s in cfg.Scripts.ToList())StopScript(s,true);}SaveConfig();try{singleInstanceMutex?.ReleaseMutex();singleInstanceMutex?.Dispose();}catch{}base.OnFormClosing(e);}
 }
@@ -686,7 +791,7 @@ public sealed class MainForm : Form
 sealed class ScriptEditorForm : Form
 {
     readonly ScriptItem s; readonly TextBox name=new(), start=new(), stop=new(), exe=new(), args=new(), work=new(), group=new(), target=new(); readonly TextBox desc=new(); readonly ComboBox version=new(); readonly CheckBox admin=new(), auto=new(), watch=new(), automaticTarget=new(), startTarget=new(), stopTarget=new(), enabled=new(); readonly NumericUpDown max=new(), delay=new(), window=new();
-    public ScriptEditorForm(ScriptItem item){s=item;Text="스크립트 설정 - "+s.Name;Width=720;Height=600;StartPosition=FormStartPosition.CenterParent;Build();}
+    public ScriptEditorForm(ScriptItem item){s=item;Text="스크립트 설정 - "+s.Name;Width=760;Height=680;MinimumSize=new Size(620,500);StartPosition=FormStartPosition.CenterParent;AutoScaleMode=AutoScaleMode.Dpi;Build();}
     void Build(){var t=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(12),ColumnCount=2,AutoScroll=true};t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,150));t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
         Add(t,"이름",name,s.Name);Add(t,"AHK 버전",version);version.DropDownStyle=ComboBoxStyle.DropDownList;version.Items.AddRange(new object[]{"Auto","v1","v2"});version.SelectedItem=s.Version is "v1" or "v2"?s.Version:"Auto";Add(t,"그룹",group,s.Group);Add(t,"시작 단축키",start,s.StartHotkey);Add(t,"종료 단축키",stop,s.StopHotkey);Add(t,"AHK 실행 파일",exe,s.AhkExe);Add(t,"실행 인자",args,s.Arguments);Add(t,"작업 디렉터리",work,s.WorkingDirectory);Add(t,"대상 프로세스",target,s.TargetProcess);Add(t,"설명",desc,s.Description);desc.Multiline=true;desc.Height=70;
         AddCheck(t,admin,"관리자 권한",s.RunAsAdmin);AddCheck(t,enabled,"활성화",s.Enabled);AddCheck(t,auto,"비정상 종료 자동 재실행",s.AutoRestart);AddCheck(t,watch,"파일 변경 시 자동 재시작",s.WatchFile);AddCheck(t,automaticTarget,"자동 프로세스 연동 사용",s.AutomaticTargetMonitoring);AddCheck(t,startTarget,"대상 프로세스 시작 시 실행",s.StartWhenTargetStarts);AddCheck(t,stopTarget,"대상 프로세스 종료 시 종료",s.StopWhenTargetExits); automaticTarget.CheckedChanged+=(a,b)=>{startTarget.Enabled=automaticTarget.Checked;stopTarget.Enabled=automaticTarget.Checked;target.Enabled=automaticTarget.Checked;};startTarget.Enabled=automaticTarget.Checked;stopTarget.Enabled=automaticTarget.Checked;target.Enabled=automaticTarget.Checked;
