@@ -800,7 +800,7 @@ public sealed class MainForm : Form
                 ["apps"] = 0x5D, ["menu"] = 0x5D, ["semicolon"] = 0xBA, [";"] = 0xBA, ["equals"] = 0xBB, ["="] = 0xBB,
                 ["comma"] = 0xBC, [","] = 0xBC, ["minus"] = 0xBD, ["-"] = 0xBD, ["period"] = 0xBE, ["."] = 0xBE,
                 ["slash"] = 0xBF, ["/"] = 0xBF, ["backquote"] = 0xC0, ["grave"] = 0xC0, ["`"] = 0xC0,
-                ["lbracket"] = 0xDB, ["["] = 0xDB, ["backslash"] = 0xDC, ["\"] = 0xDC, ["rbracket"] = 0xDD, ["]"] = 0xDD,
+                ["lbracket"] = 0xDB, ["["] = 0xDB, ["backslash"] = 0xDC, ["\\"] = 0xDC, ["rbracket"] = 0xDD, ["]"] = 0xDD,
                 ["apostrophe"] = 0xDE, ["quote"] = 0xDE, ["'"] = 0xDE
             };
             if (map.TryGetValue(p, out var v)) { vk = v; continue; }
@@ -836,7 +836,7 @@ public sealed class MainForm : Form
             using var p=Process.GetProcessById((int)pid);
             string actual=p.ProcessName;
             string configured=Path.GetFileNameWithoutExtension(targetProcess.Trim());
-            if(configured.Contains('\')) configured=Path.GetFileNameWithoutExtension(configured);
+            if(configured.Contains('\\')) configured=Path.GetFileNameWithoutExtension(configured);
             return actual.Equals(configured,StringComparison.OrdinalIgnoreCase);
         }
         catch{return false;}
