@@ -31,6 +31,7 @@ public sealed class ScriptItem
     [System.Text.Json.Serialization.JsonIgnore] public DateTime LastStart { get; set; }
     [System.Text.Json.Serialization.JsonIgnore] public DateTime LastFileWrite { get; set; }
     [System.Text.Json.Serialization.JsonIgnore] public int RestartCount { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore] public bool DesiredRunning { get; set; }
 }
 
 public sealed class ProfileItem
@@ -74,6 +75,7 @@ public sealed class MainForm : Form
     readonly string root;
     readonly string configFile;
     readonly string logDir;
+    readonly string portableFlag;
     static Mutex? singleInstanceMutex;
     bool closing;
     int nextHotkeyId = 100;
@@ -81,19 +83,27 @@ public sealed class MainForm : Form
     public MainForm()
     {
         bool created;
-        singleInstanceMutex = new Mutex(true, "@Global\AHKScriptManager_v2", out created);
+        singleInstanceMutex = new Mutex(true, @"Global\AHKScriptManager_v2", out created);
         if (!created) { MessageBox.Show("AHK Script Manager가 이미 실행 중입니다.", "AHK Script Manager", MessageBoxButtons.OK, MessageBoxIcon.Information); Environment.Exit(0); }
-        Text = "AHK Script Manager v2.2"; Width = 1180; Height = 720;
+        Text = "AHK Script Manager v2.3"; Width = 1180; Height = 720;
         StartPosition = FormStartPosition.CenterScreen;
         AllowDrop = true;
         DragEnter += OnDragEnter; DragDrop += OnDragDrop;
         root = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
-        string dataRoot = Environment.GetEnvironmentVariable("AHK_MANAGER_PORTABLE") == "1" ? root : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AHKScriptManager");
+        portableFlag = Path.Combine(root, "portable.flag");
+        bool portable = Environment.GetEnvironmentVariable("AHK_MANAGER_PORTABLE") == "1" || File.Exists(portableFlag);
+        string dataRoot = portable ? root : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AHKScriptManager");
         Directory.CreateDirectory(dataRoot);
         configFile = Path.Combine(dataRoot, "config.json");
         logDir = Path.Combine(dataRoot, "logs"); Directory.CreateDirectory(logDir);
         LoadConfig(); BuildUi(); SetupTray(); RegisterAllHotkeys();
+        if (cfg.StartMinimized)
+        {
+            WindowState = FormWindowState.Minimized;
+            if (cfg.MinimizeToTray) Hide();
+        }
         timer.Tick += (_, _) => Tick(); timer.Start();
+        UpdateStartup();
         Log("관리자 시작");
     }
 
@@ -174,7 +184,7 @@ public sealed class MainForm : Form
         var emergency = new TextBox { Text=cfg.EmergencyStopHotkey, Width=180 };
         p.Controls.Add(startWin); p.Controls.Add(trayStart); p.Controls.Add(minTray); p.Controls.Add(portable);
         p.Controls.Add(new Label{Text="긴급 전체 종료 단축키",AutoSize=true}); p.Controls.Add(emergency);
-        var save=Btn("설정 저장",(_,_)=>{cfg.StartWithWindows=startWin.Checked;cfg.StartMinimized=trayStart.Checked;cfg.MinimizeToTray=minTray.Checked;cfg.PortableMode=portable.Checked;cfg.EmergencyStopHotkey=emergency.Text;SaveConfig();RegisterAllHotkeys();UpdateStartup();Log("설정 저장");});
+        var save=Btn("설정 저장",(_,_)=>{cfg.StartWithWindows=startWin.Checked;cfg.StartMinimized=trayStart.Checked;cfg.MinimizeToTray=minTray.Checked;cfg.PortableMode=portable.Checked;cfg.EmergencyStopHotkey=emergency.Text;SaveConfig();ApplyPortableMode();RegisterAllHotkeys();UpdateStartup();Log("설정 저장");});
         p.Controls.Add(save); tab.Controls.Add(p);
     }
 
@@ -196,16 +206,16 @@ public sealed class MainForm : Form
     void StopAll(){foreach(var s in cfg.Scripts.ToList())StopScript(s);}
     void EmergencyStop(){foreach(var s in cfg.Scripts.ToList())StopScript(s,true);Log("!!! 긴급 전체 종료 !!!");}
 
-    void RunScript(ScriptItem s){RefreshPid(s);if(!s.Enabled||s.Pid.HasValue)return;if(!File.Exists(s.Path)){Log($"실행 실패: 스크립트 파일 없음 - {s.Name} / {s.Path}");return;}var exe=ResolveAhk(s);if(exe==""){Log($"실행 실패: AHK 실행기를 찾을 수 없음 - {s.Name}");MessageBox.Show($"{s.Name}\nAutoHotkey 실행 파일을 찾지 못했습니다.");return;}try{var args=$"\"{s.Path}\" {s.Arguments}".Trim();var psi=new ProcessStartInfo(exe,args){UseShellExecute=true,WorkingDirectory=Directory.Exists(s.WorkingDirectory)?s.WorkingDirectory:(Path.GetDirectoryName(s.Path)??"")};if(s.RunAsAdmin)psi.Verb="runas";var p=Process.Start(psi);if(p!=null){s.Pid=p.Id;s.LastStart=DateTime.Now;s.RestartCount=0;try{s.LastFileWrite=File.GetLastWriteTimeUtc(s.Path);}catch{}Log($"실행: {s.Name} PID={s.Pid}");SaveConfig();RefreshScripts();}}catch(Exception ex){Log($"실행 오류: {s.Name} / {ex.Message}");}}
-    void StopScript(ScriptItem s,bool force=false){RefreshPid(s);if(!s.Pid.HasValue)return;try{var p=Process.GetProcessById(s.Pid.Value);if(force||!p.CloseMainWindow()||!p.WaitForExit(1200))p.Kill(true);Log($"종료: {s.Name} PID={s.Pid}");}catch(Exception ex){Log($"종료 오류: {s.Name} / {ex.Message}");}finally{s.Pid=null;SaveConfig();RefreshScripts();}}
-    string ResolveAhk(ScriptItem s){if(File.Exists(s.AhkExe))return s.AhkExe;if(s.Version.Contains("v2")){if(File.Exists(cfg.AhkV2Path))return cfg.AhkV2Path;foreach(var p in new[]{@"C:\Program Files\AutoHotkey\v2\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\UX\AutoHotkeyUX.exe"})if(File.Exists(p))return p;}if(s.Version.Contains("v1")){if(File.Exists(cfg.AhkV1Path))return cfg.AhkV1Path;foreach(var p in new[]{@"C:\Program Files\AutoHotkey\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkeyU64.exe",@"C:\Program Files (x86)\AutoHotkey\AutoHotkey.exe"})if(File.Exists(p))return p;}foreach(var p in new[]{cfg.AhkV2Path,cfg.AhkV1Path,@"C:\Program Files\AutoHotkey\v2\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkeyU64.exe"})if(File.Exists(p))return p;return "";}
+    void RunScript(ScriptItem s, bool recovery=false){RefreshPid(s);if(!s.Enabled||s.Pid.HasValue)return;if(!File.Exists(s.Path)){Log($"실행 실패: 스크립트 파일 없음 - {s.Name} / {s.Path}");return;}var exe=ResolveAhk(s);if(exe==""){Log($"실행 실패: AHK 실행기를 찾을 수 없음 - {s.Name}");MessageBox.Show($"{s.Name}\nAutoHotkey 실행 파일을 찾지 못했습니다.");return;}try{var args=$"\"{s.Path}\" {s.Arguments}".Trim();var psi=new ProcessStartInfo(exe,args){UseShellExecute=true,WorkingDirectory=Directory.Exists(s.WorkingDirectory)?s.WorkingDirectory:(Path.GetDirectoryName(s.Path)??"")};if(s.RunAsAdmin)psi.Verb="runas";var p=Process.Start(psi);if(p!=null){s.Pid=p.Id;s.DesiredRunning=true;if(!recovery)s.RestartCount=0;s.LastStart=DateTime.Now;try{s.LastFileWrite=File.GetLastWriteTimeUtc(s.Path);}catch{}Log($"실행: {s.Name} PID={s.Pid}");SaveConfig();RefreshScripts();}}catch(Exception ex){Log($"실행 오류: {s.Name} / {ex.Message}");}}
+    void StopScript(ScriptItem s,bool force=false){s.DesiredRunning=false;RefreshPid(s);if(!s.Pid.HasValue)return;try{var p=Process.GetProcessById(s.Pid.Value);if(force||!p.CloseMainWindow()||!p.WaitForExit(1200))p.Kill(true);Log($"종료: {s.Name} PID={s.Pid}");}catch(Exception ex){Log($"종료 오류: {s.Name} / {ex.Message}");}finally{s.Pid=null;SaveConfig();RefreshScripts();}}
+    string ResolveAhk(ScriptItem s){if(File.Exists(s.AhkExe))return s.AhkExe;if(s.Version.Contains("v2")){if(File.Exists(cfg.AhkV2Path))return cfg.AhkV2Path;foreach(var p in new[]{@"C:\Program Files\AutoHotkey\v2\AutoHotkey.exe"})if(File.Exists(p))return p;}if(s.Version.Contains("v1")){if(File.Exists(cfg.AhkV1Path))return cfg.AhkV1Path;foreach(var p in new[]{@"C:\Program Files\AutoHotkey\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkeyU64.exe",@"C:\Program Files (x86)\AutoHotkey\AutoHotkey.exe"})if(File.Exists(p))return p;}foreach(var p in new[]{cfg.AhkV2Path,cfg.AhkV1Path,@"C:\Program Files\AutoHotkey\v2\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkeyU64.exe"})if(File.Exists(p))return p;return "";}
 
-    void Tick(){foreach(var s in cfg.Scripts.ToList()){bool was=s.Pid.HasValue;RefreshPid(s);if(was&&!s.Pid.HasValue){Log($"프로세스 종료 감지: {s.Name}");if(s.AutoRestart&&s.RestartCount<s.MaxRestarts){s.RestartCount++;var copy=s;_ = Task.Run(async()=>{await Task.Delay(Math.Max(0,copy.RestartDelayMs));BeginInvoke(()=>RunScript(copy));});}}if(s.Pid.HasValue&&s.WatchFile){try{var t=File.GetLastWriteTimeUtc(s.Path);if(t>s.LastFileWrite){s.LastFileWrite=t;Log($"파일 변경 감지: {s.Name}");StopScript(s);RunScript(s);}}catch{}}if(!string.IsNullOrWhiteSpace(s.TargetProcess)){bool target=Process.GetProcessesByName(Path.GetFileNameWithoutExtension(s.TargetProcess)).Length>0;if(target&&s.StartWhenTargetStarts&&!s.Pid.HasValue)RunScript(s);if(!target&&s.StopWhenTargetExits&&s.Pid.HasValue)StopScript(s);}}RefreshScripts();}
+    void Tick(){foreach(var s in cfg.Scripts.ToList()){bool was=s.Pid.HasValue;RefreshPid(s);if(was&&!s.Pid.HasValue){Log($"프로세스 종료 감지: {s.Name}");if(s.DesiredRunning&&s.AutoRestart&&s.RestartCount<s.MaxRestarts){s.RestartCount++;var copy=s;_ = Task.Run(async()=>{await Task.Delay(Math.Max(0,copy.RestartDelayMs));if(IsDisposed||!copy.DesiredRunning||!copy.Enabled)return;try{BeginInvoke(()=>RunScript(copy, true));}catch{}});}}if(s.Pid.HasValue&&s.WatchFile){try{var t=File.GetLastWriteTimeUtc(s.Path);if(t>s.LastFileWrite){s.LastFileWrite=t;Log($"파일 변경 감지: {s.Name}");bool wasDesired=s.DesiredRunning;StopScript(s);if(wasDesired)RunScript(s);}}catch{}}if(!string.IsNullOrWhiteSpace(s.TargetProcess)){bool target=Process.GetProcessesByName(Path.GetFileNameWithoutExtension(s.TargetProcess)).Length>0;if(target&&s.StartWhenTargetStarts&&!s.Pid.HasValue)RunScript(s);if(!target&&s.StopWhenTargetExits&&s.Pid.HasValue)StopScript(s);}}RefreshScripts();}
 
     void AddProfile(){string name=Prompt("프로필 이름", "새 프로필");if(string.IsNullOrWhiteSpace(name))return;cfg.Profiles.Add(new ProfileItem{Name=name,ScriptIds=cfg.Scripts.Select(s=>s.Id).ToList()});SaveConfig();RefreshProfiles();}
     ProfileItem? SelectedProfile(){return profiles.SelectedIndex<0?null:cfg.Profiles.ElementAtOrDefault(profiles.SelectedIndex);}
-    void RunProfile(){var p=SelectedProfile();if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null){RunScript(s);Thread.Sleep(Math.Max(0,p.StartDelayMs));}}}
-    void StopProfile(){var p=SelectedProfile();if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)StopScript(s);Thread.Sleep(Math.Max(0,p.StopDelayMs));}}
+    async void RunProfile(){var p=SelectedProfile();if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)RunScript(s);if(p.StartDelayMs>0)await Task.Delay(p.StartDelayMs);}}
+    async void StopProfile(){var p=SelectedProfile();if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)StopScript(s);if(p.StopDelayMs>0)await Task.Delay(p.StopDelayMs);}}
     void DeleteProfile(){var p=SelectedProfile();if(p==null)return;cfg.Profiles.Remove(p);SaveConfig();RefreshProfiles();}
 
     void EditSelected(){var s=Selected();if(s==null)return;using var f=new ScriptEditorForm(s);if(f.ShowDialog(this)==DialogResult.OK){SaveConfig();RegisterAllHotkeys();RefreshScripts();Log($"스크립트 설정 저장: {s.Name}");}}
@@ -219,7 +229,7 @@ public sealed class MainForm : Form
         var m=MessageBox.Show("예 = 내보내기 / 아니오 = 가져오기", "설정 백업", MessageBoxButtons.YesNoCancel);
         if(m==DialogResult.Cancel)return;
         if(m==DialogResult.Yes){using var d=new SaveFileDialog{Filter="JSON (*.json)|*.json",FileName="AHKScriptManager_Backup.json"};if(d.ShowDialog()==DialogResult.OK){SaveConfig();File.Copy(configFile,d.FileName,true);Log("설정 내보내기 완료");}}
-        else {using var d=new OpenFileDialog{Filter="JSON (*.json)|*.json"};if(d.ShowDialog()!=DialogResult.OK)return;try{var x=JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(d.FileName));if(x==null)throw new Exception("잘못된 설정 파일");cfg.Scripts.Clear();cfg.Profiles.Clear();cfg.Scripts.AddRange(x.Scripts);cfg.Profiles.AddRange(x.Profiles);cfg.StartWithWindows=x.StartWithWindows;cfg.StartMinimized=x.StartMinimized;cfg.MinimizeToTray=x.MinimizeToTray;cfg.PortableMode=x.PortableMode;cfg.EmergencyStopHotkey=x.EmergencyStopHotkey;cfg.AhkV1Path=x.AhkV1Path;cfg.AhkV2Path=x.AhkV2Path;SaveConfig();RegisterAllHotkeys();RefreshScripts();RefreshProfiles();Log("설정 가져오기 완료");}catch(Exception ex){MessageBox.Show("가져오기 실패: "+ex.Message);}}
+        else {using var d=new OpenFileDialog{Filter="JSON (*.json)|*.json"};if(d.ShowDialog()!=DialogResult.OK)return;try{var x=JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(d.FileName));if(x==null)throw new Exception("잘못된 설정 파일");cfg.Scripts.Clear();cfg.Profiles.Clear();cfg.Scripts.AddRange(x.Scripts ?? new List<ScriptItem>());cfg.Profiles.AddRange(x.Profiles ?? new List<ProfileItem>());cfg.StartWithWindows=x.StartWithWindows;cfg.StartMinimized=x.StartMinimized;cfg.MinimizeToTray=x.MinimizeToTray;cfg.PortableMode=x.PortableMode;cfg.EmergencyStopHotkey=x.EmergencyStopHotkey;cfg.AhkV1Path=x.AhkV1Path;cfg.AhkV2Path=x.AhkV2Path;NormalizeConfig();SaveConfig();ApplyPortableMode();RegisterAllHotkeys();RefreshScripts();RefreshProfiles();Log("설정 가져오기 완료");}catch(Exception ex){MessageBox.Show("가져오기 실패: "+ex.Message);}}
     }
 
     void SetupTray(){tray.Icon=SystemIcons.Application;tray.Text="AHK Script Manager";var m=new ContextMenuStrip();m.Items.Add("열기",null,(_,_)=>ShowFromTray());m.Items.Add("전체 실행",null,(_,_)=>RunAll());m.Items.Add("전체 종료",null,(_,_)=>StopAll());m.Items.Add("긴급 종료",null,(_,_)=>EmergencyStop());m.Items.Add("종료",null,(_,_)=>{closing=true;Close();});tray.ContextMenuStrip=m;tray.DoubleClick+=(s,e)=>ShowFromTray();tray.Visible=true;}
@@ -227,10 +237,42 @@ public sealed class MainForm : Form
     protected override void OnResize(EventArgs e){base.OnResize(e);if(WindowState==FormWindowState.Minimized&&cfg.MinimizeToTray)Hide();}
 
     void RegisterAllHotkeys(){foreach(var id in hotkeys.Keys.ToList())UnregisterHotKey(Handle,id);hotkeys.Clear();var used=new HashSet<string>(StringComparer.OrdinalIgnoreCase);foreach(var s in cfg.Scripts.Where(x=>x.Enabled)){TryRegister(s.StartHotkey,()=>RunScript(s),used,$"{s.Name} 시작");TryRegister(s.StopHotkey,()=>StopScript(s),used,$"{s.Name} 종료");}TryRegister(cfg.EmergencyStopHotkey,EmergencyStop,used,"긴급 전체 종료");foreach(var p in cfg.Profiles){TryRegister(p.StartHotkey,()=>RunProfileByName(p.Name),used,$"프로필 {p.Name} 시작");TryRegister(p.StopHotkey,()=>StopProfileByName(p.Name),used,$"프로필 {p.Name} 종료");}}
-    void RunProfileByName(string n){var p=cfg.Profiles.FirstOrDefault(x=>x.Name==n);if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)RunScript(s);}}
-    void StopProfileByName(string n){var p=cfg.Profiles.FirstOrDefault(x=>x.Name==n);if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)StopScript(s);}}
-    void TryRegister(string text,Action action,HashSet<string> used,string owner){if(string.IsNullOrWhiteSpace(text))return;if(!used.Add(text.Trim())){Log($"단축키 충돌: {text} / {owner}");return;}if(!ParseHotkey(text,out var mod,out var vk)){Log($"지원하지 않는 단축키: {text}");return;}int id=nextHotkeyId++;if(RegisterHotKey(Handle,id,mod,vk))hotkeys[id]=action;else Log($"단축키 등록 실패: {text} / {owner}");}
-    bool ParseHotkey(string text,out uint mod,out uint vk){mod=0;vk=0;var parts=text.Split('+',StringSplitOptions.RemoveEmptyEntries|StringSplitOptions.TrimEntries);foreach(var raw in parts){var p=raw.ToLowerInvariant();switch(p){case "ctrl":case "control":mod|=MOD_CONTROL;continue;case "alt":mod|=MOD_ALT;continue;case "shift":mod|=MOD_SHIFT;continue;case "win":case "windows":mod|=MOD_WIN;continue;}if(p.Length==1){vk=char.ToUpperInvariant(p[0]);continue;}if(p.StartsWith("f")&&int.TryParse(p[1..],out var n)&&n>=1&&n<=24){vk=(uint)(0x70+n-1);continue;}if(p.StartsWith("num")&&int.TryParse(p[3..],out var k)&&k>=0&&k<=9){vk=(uint)(0x60+k);continue;}var map=new Dictionary<string,uint>{{"pause",0x13},{"space",0x20},{"enter",0x0D},{"esc",0x1B},{"escape",0x1B},{"tab",0x09},{"insert",0x2D},{"delete",0x2E},{"home",0x24},{"end",0x23},{"pageup",0x21},{"pagedown",0x22},{"left",0x25},{"up",0x26},{"right",0x27},{"down",0x28}};if(map.TryGetValue(p,out var v)){vk=v;continue;}return false;}return vk!=0;}
+    async void RunProfileByName(string n){var p=cfg.Profiles.FirstOrDefault(x=>x.Name==n);if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)RunScript(s);if(p.StartDelayMs>0)await Task.Delay(p.StartDelayMs);}}
+    async void StopProfileByName(string n){var p=cfg.Profiles.FirstOrDefault(x=>x.Name==n);if(p==null)return;foreach(var id in p.ScriptIds){var s=cfg.Scripts.FirstOrDefault(x=>x.Id==id);if(s!=null)StopScript(s);if(p.StopDelayMs>0)await Task.Delay(p.StopDelayMs);}}
+    void TryRegister(string text,Action action,HashSet<string> used,string owner){if(string.IsNullOrWhiteSpace(text))return;if(!ParseHotkey(text,out var mod,out var vk)){Log($"지원하지 않는 단축키: {text} / {owner}");return;}string key=$"{mod}:{vk}";if(!used.Add(key)){Log($"단축키 충돌: {text} / {owner}");return;}int id=nextHotkeyId++;if(RegisterHotKey(Handle,id,mod,vk))hotkeys[id]=action;else Log($"단축키 등록 실패: {text} / {owner}");}
+    bool ParseHotkey(string text, out uint mod, out uint vk)
+    {
+        mod = 0; vk = 0;
+        var parts = text.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        int keyCount = 0;
+        foreach (var raw in parts)
+        {
+            var p = raw.ToLowerInvariant();
+            switch (p)
+            {
+                case "ctrl": case "control": mod |= MOD_CONTROL; continue;
+                case "alt": mod |= MOD_ALT; continue;
+                case "shift": mod |= MOD_SHIFT; continue;
+                case "win": case "windows": mod |= MOD_WIN; continue;
+            }
+            if (keyCount++ > 0) return false;
+            if (p.Length == 1 && char.IsLetterOrDigit(p[0])) { vk = char.ToUpperInvariant(p[0]); continue; }
+            if (p.StartsWith("f") && int.TryParse(p[1..], out var n) && n >= 1 && n <= 24) { vk = (uint)(0x70 + n - 1); continue; }
+            if (p.StartsWith("num") && int.TryParse(p[3..], out var k) && k >= 0 && k <= 9) { vk = (uint)(0x60 + k); continue; }
+            var map = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["pause"] = 0x13, ["space"] = 0x20, ["enter"] = 0x0D, ["esc"] = 0x1B, ["escape"] = 0x1B,
+                ["tab"] = 0x09, ["insert"] = 0x2D, ["delete"] = 0x2E, ["home"] = 0x24, ["end"] = 0x23,
+                ["pageup"] = 0x21, ["pagedown"] = 0x22, ["left"] = 0x25, ["up"] = 0x26,
+                ["right"] = 0x27, ["down"] = 0x28, ["backspace"] = 0x08, ["capslock"] = 0x14,
+                ["scrolllock"] = 0x91, ["numlock"] = 0x90, ["printscreen"] = 0x2C
+            };
+            if (map.TryGetValue(p, out var v)) { vk = v; continue; }
+            return false;
+        }
+        return keyCount == 1 && vk != 0;
+    }
+
     protected override void WndProc(ref Message m){if(m.Msg==WM_HOTKEY&&hotkeys.TryGetValue(m.WParam.ToInt32(),out var a)){try{BeginInvoke(a);}catch{}}base.WndProc(ref m);}
 
     void UpdateStartup(){try{using var k=Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run",true);if(k==null)return;if(cfg.StartWithWindows)k.SetValue("AHKScriptManager",Application.ExecutablePath);else k.DeleteValue("AHKScriptManager",false);}catch(Exception ex){Log("시작프로그램 설정 실패: "+ex.Message);}}
@@ -240,11 +282,10 @@ public sealed class MainForm : Form
             string json=File.ReadAllText(configFile);
             var x=JsonSerializer.Deserialize<AppConfig>(json);
             if(x==null) throw new Exception("설정 파일이 비어 있습니다.");
-            cfg.Scripts.AddRange(x.Scripts); cfg.Profiles.AddRange(x.Profiles);
+            if (x.Scripts != null) cfg.Scripts.AddRange(x.Scripts.Where(s => s != null));
+            if (x.Profiles != null) cfg.Profiles.AddRange(x.Profiles.Where(p => p != null));
             cfg.StartWithWindows=x.StartWithWindows; cfg.StartMinimized=x.StartMinimized; cfg.MinimizeToTray=x.MinimizeToTray; cfg.PortableMode=x.PortableMode; cfg.EmergencyStopHotkey=x.EmergencyStopHotkey; cfg.AhkV1Path=x.AhkV1Path; cfg.AhkV2Path=x.AhkV2Path;
-            var ids=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach(var s in cfg.Scripts){ if(string.IsNullOrWhiteSpace(s.Id)||!ids.Add(s.Id)) s.Id=Guid.NewGuid().ToString("N"); }
-            foreach(var p in cfg.Profiles) p.ScriptIds=p.ScriptIds.Where(id=>cfg.Scripts.Any(s=>s.Id==id)).Distinct().ToList();
+            NormalizeConfig();
         }catch(Exception ex){
             try{
                 string bad=configFile+".corrupt_"+DateTime.Now.ToString("yyyyMMdd_HHmmss");
@@ -254,6 +295,46 @@ public sealed class MainForm : Form
             cfg.Scripts.Clear(); cfg.Profiles.Clear();
         }
     }
+    void NormalizeConfig(){
+        var ids=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach(var s in cfg.Scripts){
+            if(string.IsNullOrWhiteSpace(s.Id)||!ids.Add(s.Id)) s.Id=Guid.NewGuid().ToString("N");
+            s.MaxRestarts=Math.Clamp(s.MaxRestarts,0,100);
+            s.RestartDelayMs=Math.Clamp(s.RestartDelayMs,0,600000);
+            s.WorkingDirectory=s.WorkingDirectory ?? "";
+            s.TargetProcess=s.TargetProcess ?? "";
+            s.StartHotkey=s.StartHotkey ?? "";
+            s.StopHotkey=s.StopHotkey ?? "";
+        }
+        foreach(var p in cfg.Profiles){
+            p.ScriptIds=(p.ScriptIds ?? new List<string>()).Where(id=>cfg.Scripts.Any(s=>s.Id==id)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            p.StartDelayMs=Math.Clamp(p.StartDelayMs,0,600000);
+            p.StopDelayMs=Math.Clamp(p.StopDelayMs,0,600000);
+        }
+    }
+
+    void ApplyPortableMode(){
+        try{
+            bool want=cfg.PortableMode;
+            bool current=File.Exists(portableFlag);
+            if(want==current)return;
+            string local=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"AHKScriptManager");
+            string localConfig=Path.Combine(local,"config.json");
+            string rootConfig=Path.Combine(root,"config.json");
+            if(want){
+                Directory.CreateDirectory(root);
+                if(File.Exists(localConfig)&&!File.Exists(rootConfig))File.Copy(localConfig,rootConfig,true);
+                File.WriteAllText(portableFlag,"AHK Script Manager portable mode");
+                Log("포터블 모드 활성화: 프로그램 재시작 후 적용됩니다.");
+            }else{
+                Directory.CreateDirectory(local);
+                if(File.Exists(rootConfig))File.Copy(rootConfig,localConfig,true);
+                File.Delete(portableFlag);
+                Log("포터블 모드 비활성화: 프로그램 재시작 후 적용됩니다.");
+            }
+        }catch(Exception ex){Log("포터블 모드 전환 실패: "+ex.Message);}
+    }
+
     void SaveConfig(){
         try{
             Directory.CreateDirectory(Path.GetDirectoryName(configFile)!);
