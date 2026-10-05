@@ -81,7 +81,7 @@ public sealed class MainForm : Form
     public MainForm()
     {
         bool created;
-        singleInstanceMutex = new Mutex(true, "Global\AHKScriptManager_v2", out created);
+        singleInstanceMutex = new Mutex(true, "@Global\AHKScriptManager_v2", out created);
         if (!created) { MessageBox.Show("AHK Script Manager가 이미 실행 중입니다.", "AHK Script Manager", MessageBoxButtons.OK, MessageBoxIcon.Information); Environment.Exit(0); }
         Text = "AHK Script Manager v2.2"; Width = 1180; Height = 720;
         StartPosition = FormStartPosition.CenterScreen;
