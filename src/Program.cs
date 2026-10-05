@@ -138,7 +138,7 @@ public sealed class MainForm : Form
         bool created;
         singleInstanceMutex = new Mutex(true, @"Global\AHKScriptManager_v2", out created);
         if (!created) { MessageBox.Show("AHK Script Manager가 이미 실행 중입니다.", "AHK Script Manager", MessageBoxButtons.OK, MessageBoxIcon.Information); Environment.Exit(0); }
-        Text = "AHK Script Manager v3.3.3"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
+        Text = "AHK Script Manager v3.4.3"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         appIcon = LoadAppIcon();
@@ -754,14 +754,14 @@ public sealed class MainForm : Form
         if(RegisterHotKey(Handle,id,registerMod,vk))
         {
             hotkeys[id]=new HotkeyBinding{Action=action,Script=script,Owner=owner};
-            string scope=script==null||string.IsNullOrWhiteSpace(script.TargetProcess)?"전역":"대상 프로세스 전용: "+Path.GetFileName(script.TargetProcess);
-            Log($"단축키 등록: {text} / {owner} / {scope}");
+            string scope=script==null||string.IsNullOrWhiteSpace(script.TargetProcess)?"전역":"대상 프로세스 전용: "+NormalizeTargetProcess(script.TargetProcess);
+            Log($"단축키 등록 성공: {text} / {owner} / ID={id} / MOD=0x{registerMod:X} / VK=0x{vk:X2} / {scope}");
         }
         else
         {
             int error=Marshal.GetLastWin32Error();
             string reason=error==ERROR_HOTKEY_ALREADY_REGISTERED?"이미 다른 프로그램이 사용 중":$"Windows 오류 {error}";
-            Log($"단축키 등록 실패: {text} / {owner} / {reason}");
+            Log($"단축키 등록 실패: {text} / {owner} / ID={id} / MOD=0x{registerMod:X} / VK=0x{vk:X2} / {reason}({error})");
         }
     }
     bool ParseHotkey(string text, out uint mod, out uint vk)
@@ -813,16 +813,28 @@ public sealed class MainForm : Form
 
     protected override void WndProc(ref Message m)
     {
-        if(m.Msg==WM_HOTKEY && hotkeys.TryGetValue(m.WParam.ToInt32(),out var binding))
+        if(m.Msg==WM_HOTKEY)
         {
-            Log($"단축키 감지: {binding.Owner}");
-            if(binding.Script!=null && !IsTargetProcessForeground(binding.Script.TargetProcess))
+            int id=m.WParam.ToInt32();
+            uint lp=unchecked((uint)m.LParam.ToInt64());
+            uint messageMod=lp & 0xFFFF;
+            uint messageVk=(lp >> 16) & 0xFFFF;
+            if(hotkeys.TryGetValue(id,out var binding))
             {
-                Log($"단축키 무시: {binding.Owner} / 대상 프로세스가 포그라운드가 아님 / 대상={binding.Script.TargetProcess}");
+                Log($"단축키 감지: {binding.Owner} / ID={id} / MOD=0x{messageMod:X} / VK=0x{messageVk:X2}");
+                if(binding.Script!=null && !IsTargetProcessForeground(binding.Script.TargetProcess))
+                {
+                    string foreground=GetForegroundProcessDescription();
+                    Log($"단축키 무시: {binding.Owner} / 대상 프로세스가 포그라운드가 아님 / 대상={NormalizeTargetProcess(binding.Script.TargetProcess)} / 현재={foreground}");
+                }
+                else
+                {
+                    try{BeginInvoke(binding.Action);Log($"단축키 실행 전달: {binding.Owner}");}catch(Exception ex){Log($"단축키 실행 전달 실패: {binding.Owner} / {ex.Message}");}
+                }
             }
             else
             {
-                try{BeginInvoke(binding.Action);}catch(Exception ex){Log($"단축키 실행 전달 실패: {binding.Owner} / {ex.Message}");}
+                Log($"등록되지 않은 WM_HOTKEY 수신: ID={id} / MOD=0x{messageMod:X} / VK=0x{messageVk:X2}");
             }
         }
         base.WndProc(ref m);
@@ -839,19 +851,40 @@ public sealed class MainForm : Form
         catch { return false; }
     }
 
+    static string NormalizeTargetProcess(string targetProcess)
+    {
+        string configured=targetProcess.Trim();
+        if(configured.Length>=2 && configured[0]=='"' && configured[^1]=='"') configured=configured[1..^1].Trim();
+        configured=configured.Trim();
+        if(configured.Contains('\\') || configured.Contains('/')) configured=Path.GetFileName(configured);
+        configured=Path.GetFileNameWithoutExtension(configured);
+        return configured.Trim();
+    }
+
+    string GetForegroundProcessDescription()
+    {
+        try
+        {
+            var hwnd=GetForegroundWindow();
+            if(hwnd==IntPtr.Zero) return "HWND 없음";
+            if(GetWindowThreadProcessId(hwnd,out var pid)==0 || pid==0) return $"PID={pid}";
+            using var p=Process.GetProcessById((int)pid);
+            return $"{p.ProcessName}.exe (PID={pid})";
+        }
+        catch(Exception ex){return $"확인 실패: {ex.Message}";}
+    }
+
     bool IsTargetProcessForeground(string targetProcess)
     {
-        if(string.IsNullOrWhiteSpace(targetProcess)) return true;
+        string configured=NormalizeTargetProcess(targetProcess);
+        if(string.IsNullOrWhiteSpace(configured)) return true;
         var hwnd=GetForegroundWindow();
         if(hwnd==IntPtr.Zero) return false;
         if(GetWindowThreadProcessId(hwnd,out var pid)==0 || pid==0) return false;
         try
         {
             using var p=Process.GetProcessById((int)pid);
-            string actual=p.ProcessName;
-            string configured=Path.GetFileNameWithoutExtension(targetProcess.Trim());
-            if(configured.Contains('\\')) configured=Path.GetFileNameWithoutExtension(configured);
-            return actual.Equals(configured,StringComparison.OrdinalIgnoreCase);
+            return p.ProcessName.Equals(configured,StringComparison.OrdinalIgnoreCase);
         }
         catch{return false;}
     }
