@@ -127,7 +127,7 @@ public sealed class MainForm : Form
         bool created;
         singleInstanceMutex = new Mutex(true, @"Global\AHKScriptManager_v2", out created);
         if (!created) { MessageBox.Show("AHK Script Manager가 이미 실행 중입니다.", "AHK Script Manager", MessageBoxButtons.OK, MessageBoxIcon.Information); Environment.Exit(0); }
-        Text = "AHK Script Manager v3.3"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
+        Text = "AHK Script Manager v3.3.2"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         appIcon = LoadAppIcon();
