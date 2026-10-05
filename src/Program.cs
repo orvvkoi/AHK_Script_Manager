@@ -106,6 +106,7 @@ public sealed class MainForm : Form
     string lastScriptUiSignature = "";
     string lastProfileUiSignature = "";
     readonly NotifyIcon tray = new();
+    readonly Icon appIcon;
     readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
     readonly Dictionary<int, Action> hotkeys = new();
     readonly string root;
@@ -129,6 +130,8 @@ public sealed class MainForm : Form
         Text = "AHK Script Manager v3.3"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
+        appIcon = LoadAppIcon();
+        Icon = appIcon;
         AllowDrop = true;
         DragEnter += OnDragEnter; DragDrop += OnDragDrop;
         root = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
@@ -652,7 +655,14 @@ public sealed class MainForm : Form
         else {using var d=new OpenFileDialog{Filter="JSON (*.json)|*.json"};if(d.ShowDialog()!=DialogResult.OK)return;try{var x=JsonSerializer.Deserialize(File.ReadAllText(d.FileName), AppJsonContext.Default.AppConfig);if(x==null)throw new Exception("잘못된 설정 파일");cfg.Scripts.Clear();cfg.Profiles.Clear();cfg.Scripts.AddRange(x.Scripts ?? new List<ScriptItem>());cfg.Profiles.AddRange(x.Profiles ?? new List<ProfileItem>());cfg.StartWithWindows=x.StartWithWindows;cfg.StartMinimized=x.StartMinimized;cfg.MinimizeToTray=x.MinimizeToTray;cfg.PortableMode=x.PortableMode;cfg.EmergencyStopHotkey=x.EmergencyStopHotkey;cfg.AhkV1Path=x.AhkV1Path;cfg.AhkV2Path=x.AhkV2Path;cfg.StopScriptsOnManagerExit=x.StopScriptsOnManagerExit;cfg.GracefulStopTimeoutMs=x.GracefulStopTimeoutMs;cfg.SchemaVersion=x.SchemaVersion;futureConfigVersion=false;NormalizeConfig();SaveConfig();ApplyPortableMode();RegisterAllHotkeys();RefreshScripts(true);RefreshProfiles(true);Log("설정 가져오기 완료");}catch(Exception ex){MessageBox.Show("가져오기 실패: "+ex.Message);}}
     }
 
-    void SetupTray(){tray.Icon=SystemIcons.Application;tray.Text="AHK Script Manager";var m=new ContextMenuStrip();m.Items.Add("열기",null,(_,_)=>ShowFromTray());m.Items.Add("전체 실행",null,(_,_)=>RunAll());m.Items.Add("전체 종료",null,(_,_)=>StopAll());m.Items.Add("긴급 종료",null,(_,_)=>EmergencyStop());m.Items.Add("종료",null,(_,_)=>{closing=true;Close();});tray.ContextMenuStrip=m;tray.DoubleClick+=(s,e)=>ShowFromTray();tray.Visible=true;}
+    static Icon LoadAppIcon()
+    {
+        var stream = typeof(MainForm).Assembly.GetManifestResourceStream("AHKScriptManager.app.ico");
+        if (stream != null) return new Icon(stream);
+        return SystemIcons.Application;
+    }
+
+    void SetupTray(){tray.Icon=appIcon;tray.Text="AHK Script Manager";var m=new ContextMenuStrip();m.Items.Add("열기",null,(_,_)=>ShowFromTray());m.Items.Add("전체 실행",null,(_,_)=>RunAll());m.Items.Add("전체 종료",null,(_,_)=>StopAll());m.Items.Add("긴급 종료",null,(_,_)=>EmergencyStop());m.Items.Add("종료",null,(_,_)=>{closing=true;Close();});tray.ContextMenuStrip=m;tray.DoubleClick+=(s,e)=>ShowFromTray();tray.Visible=true;}
     void ShowFromTray(){Show();WindowState=FormWindowState.Normal;Activate();}
     protected override void OnResize(EventArgs e){base.OnResize(e);if(WindowState==FormWindowState.Minimized&&cfg.MinimizeToTray)Hide();}
 
@@ -838,7 +848,13 @@ sealed class ScriptEditorForm : Form
     readonly ScriptItem s; readonly TextBox name=new(), start=new(), stop=new(), exe=new(), args=new(), work=new(), group=new(), target=new(); readonly TextBox desc=new(); readonly ComboBox version=new(); readonly CheckBox admin=new(), auto=new(), watch=new(), automaticTarget=new(), startTarget=new(), stopTarget=new(), enabled=new(); readonly NumericUpDown max=new(), delay=new(), window=new();
     public ScriptEditorForm(ScriptItem item){s=item;Text="스크립트 설정 - "+s.Name;Width=760;Height=680;MinimumSize=new Size(620,500);StartPosition=FormStartPosition.CenterParent;AutoScaleMode=AutoScaleMode.Dpi;Build();}
     void Build(){var t=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(12),ColumnCount=2,AutoScroll=true};t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,150));t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
-        Add(t,"이름",name,s.Name);Add(t,"AHK 버전",version);version.DropDownStyle=ComboBoxStyle.DropDownList;version.Items.AddRange(new object[]{"Auto","v1","v2"});version.SelectedItem=s.Version is "v1" or "v2"?s.Version:"Auto";Add(t,"그룹",group,s.Group);Add(t,"시작 단축키",start,s.StartHotkey);Add(t,"종료 단축키",stop,s.StopHotkey);Add(t,"AHK 실행 파일",exe,s.AhkExe);Add(t,"실행 인자",args,s.Arguments);Add(t,"작업 디렉터리",work,s.WorkingDirectory);
+        Add(t,"이름",name,s.Name);Add(t,"AHK 버전",version);version.DropDownStyle=ComboBoxStyle.DropDownList;version.Items.AddRange(new object[]{"Auto","v1","v2"});version.SelectedItem=s.Version is "v1" or "v2"?s.Version:"Auto";Add(t,"그룹",group,s.Group);Add(t,"시작 단축키",start,s.StartHotkey);Add(t,"종료 단축키",stop,s.StopHotkey);
+        t.Controls.Add(new Label{Text="AHK 실행 파일",AutoSize=true,Anchor=AnchorStyles.Left});
+        var exePanel=new FlowLayoutPanel{Dock=DockStyle.Fill,AutoSize=false,WrapContents=false,Margin=new Padding(0),Padding=new Padding(0)};
+        exe.Dock=DockStyle.Fill; exePanel.Controls.Add(exe);
+        var pickExe=new Button{Text="찾기",Width=70,Height=26,Margin=new Padding(6,0,0,0)}; exePanel.Controls.Add(pickExe); t.Controls.Add(exePanel);
+        pickExe.Click+=(a,b)=>{using var d=new OpenFileDialog{Title="AutoHotkey 실행 파일 선택",Filter="AutoHotkey 실행 파일 (*.exe)|*.exe|모든 파일 (*.*)|*.*",CheckFileExists=true};if(!string.IsNullOrWhiteSpace(exe.Text)&&File.Exists(exe.Text))d.FileName=exe.Text;if(d.ShowDialog(this)==DialogResult.OK)exe.Text=d.FileName;};
+        Add(t,"실행 인자",args,s.Arguments);Add(t,"작업 디렉터리",work,s.WorkingDirectory);
         t.Controls.Add(new Label{Text="대상 프로세스",AutoSize=true,Anchor=AnchorStyles.Left});
         var targetPanel=new FlowLayoutPanel{Dock=DockStyle.Fill,AutoSize=false,WrapContents=false,Margin=new Padding(0),Padding=new Padding(0)};
         target.Width=300; targetPanel.Controls.Add(target);

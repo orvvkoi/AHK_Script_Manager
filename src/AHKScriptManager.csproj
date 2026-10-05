@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>AHKScriptManager</AssemblyName>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <Version>3.3.0</Version>
     <FileVersion>3.3.0</FileVersion>
     <AssemblyVersion>3.3.0.0</AssemblyVersion>
@@ -18,6 +19,7 @@
     <PublishTrimmed>false</PublishTrimmed>
     <TrimMode>partial</TrimMode>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <EmbeddedResource Include="app.ico" />
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
