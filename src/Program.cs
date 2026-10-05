@@ -5,7 +5,7 @@ using Microsoft.Win32;
 
 namespace AHKScriptManager;
 
-enum RestartReason { None, Crash, FileChanged, TargetStarted, Profile }
+public enum RestartReason { None, Crash, FileChanged, TargetStarted, Profile }
 
 static class ConfigSchema
 {
