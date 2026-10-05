@@ -1,0 +1,37 @@
+name: Build AHK Script Manager EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish EXE
+        run: dotnet publish src/AHKScriptManager.csproj -c Release -r win-x64 --self-contained true
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $publish = "src/bin/Release/net8.0-windows/win-x64/publish"
+          $output = "AHKScriptManager-win-x64.zip"
+
+          Compress-Archive `
+            -Path "$publish/*" `
+            -DestinationPath $output `
+            -Force
+
+      - name: Upload EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AHKScriptManager-win-x64
+          path: AHKScriptManager-win-x64.zip
