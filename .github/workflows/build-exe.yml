@@ -1,4 +1,4 @@
-name: Build AHK Script Manager v3.0 EXE
+name: Build AHK Script Manager v3.2 EXE
 
 on:
   workflow_dispatch:
@@ -46,19 +46,19 @@ jobs:
           -p:InvariantGlobalization=true
           -o publish
 
-      - name: Prepare portable package
+      - name: Prepare EXE package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item publish/AHKScriptManager.exe package/AHKScriptManager.exe
           if (-not (Test-Path package/AHKScriptManager.exe)) { throw "EXE output not found" }
           if ((Get-Item package/AHKScriptManager.exe).Length -lt 1000000) { throw "EXE output looks invalid" }
-          Compress-Archive -Path package/* -DestinationPath AHKScriptManager-win-x64.zip -Force
+          Compress-Archive -Path package/AHKScriptManager.exe -DestinationPath AHKScriptManager-win-x64.zip -Force
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AHKScriptManager-v3.0-win-x64
+          name: AHKScriptManager-v3.2-win-x64
           path: AHKScriptManager-win-x64.zip
           if-no-files-found: error
           retention-days: 30
