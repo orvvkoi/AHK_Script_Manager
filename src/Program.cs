@@ -418,7 +418,9 @@ public sealed class MainForm : Form
             var psi=new ProcessStartInfo(exe){UseShellExecute=true,WorkingDirectory=Directory.Exists(s.WorkingDirectory)?s.WorkingDirectory:(Path.GetDirectoryName(s.Path)??"")};
             psi.ArgumentList.Add(s.Path);
             foreach(var arg in SplitArguments(s.Arguments)) psi.ArgumentList.Add(arg);
-            if(s.RunAsAdmin)psi.Verb="runas";
+            // 이미 관리자 권한으로 실행 중인 Manager는 같은 관리자 토큰으로 AHK를 실행한다.
+            // 이 경우 불필요한 runas ShellExecute를 사용하지 않아 UAC 재확인을 방지한다.
+            if(s.RunAsAdmin && !IsCurrentProcessElevated()) psi.Verb="runas";
             var p=Process.Start(psi);
             if(p!=null)
             {
@@ -813,16 +815,28 @@ public sealed class MainForm : Form
     {
         if(m.Msg==WM_HOTKEY && hotkeys.TryGetValue(m.WParam.ToInt32(),out var binding))
         {
+            Log($"단축키 감지: {binding.Owner}");
             if(binding.Script!=null && !IsTargetProcessForeground(binding.Script.TargetProcess))
             {
-                Log($"단축키 무시: {binding.Owner} / 대상 프로세스가 포그라운드가 아님");
+                Log($"단축키 무시: {binding.Owner} / 대상 프로세스가 포그라운드가 아님 / 대상={binding.Script.TargetProcess}");
             }
             else
             {
-                try{BeginInvoke(binding.Action);}catch{}
+                try{BeginInvoke(binding.Action);}catch(Exception ex){Log($"단축키 실행 전달 실패: {binding.Owner} / {ex.Message}");}
             }
         }
         base.WndProc(ref m);
+    }
+
+    static bool IsCurrentProcessElevated()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
     }
 
     bool IsTargetProcessForeground(string targetProcess)
