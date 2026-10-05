@@ -7,6 +7,13 @@ namespace AHKScriptManager;
 
 public enum RestartReason { None, Crash, FileChanged, TargetStarted, Profile, Manual }
 
+sealed class HotkeyBinding
+{
+    public Action Action { get; init; } = static () => { };
+    public ScriptItem? Script { get; init; }
+    public string Owner { get; init; } = "";
+}
+
 static class ConfigSchema
 {
     public const int Current = 3;
@@ -92,8 +99,12 @@ public sealed class MainForm : Form
 {
     const int WM_HOTKEY = 0x0312;
     const uint MOD_ALT = 0x0001, MOD_CONTROL = 0x0002, MOD_SHIFT = 0x0004, MOD_WIN = 0x0008;
-    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    const uint MOD_NOREPEAT = 0x4000;
+    const int ERROR_HOTKEY_ALREADY_REGISTERED = 1409;
+    [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", SetLastError = true)] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
     readonly AppConfig cfg = new();
     readonly ListView scripts = new();
@@ -108,7 +119,7 @@ public sealed class MainForm : Form
     readonly NotifyIcon tray = new();
     readonly Icon appIcon;
     readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
-    readonly Dictionary<int, Action> hotkeys = new();
+    readonly Dictionary<int, HotkeyBinding> hotkeys = new();
     readonly string root;
     readonly string configFile;
     readonly string logDir;
@@ -127,7 +138,7 @@ public sealed class MainForm : Form
         bool created;
         singleInstanceMutex = new Mutex(true, @"Global\AHKScriptManager_v2", out created);
         if (!created) { MessageBox.Show("AHK Script Manager가 이미 실행 중입니다.", "AHK Script Manager", MessageBoxButtons.OK, MessageBoxIcon.Information); Environment.Exit(0); }
-        Text = "AHK Script Manager v3.3.2"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
+        Text = "AHK Script Manager v3.3.3"; Width = 1180; Height = 720; MinimumSize = new Size(980, 620); BackColor = Color.FromArgb(248,249,250); Font = new Font("Segoe UI", 9F);
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         appIcon = LoadAppIcon();
@@ -208,11 +219,30 @@ public sealed class MainForm : Form
         tab.Controls.Add(split); RefreshScripts(true);
     }
 
+    string GetScriptStateText(ScriptItem s)
+    {
+        RefreshPid(s);
+        if(!s.Enabled) return "× 비활성";
+        if(!s.Pid.HasValue) return "○ 대기";
+        try
+        {
+            using var p=Process.GetProcessById(s.Pid.Value);
+            if(p.HasExited) return "○ 대기";
+            string? exe=null;
+            try{exe=p.MainModule?.FileName;}catch{}
+            var expected=ResolveAhk(s);
+            if(!string.IsNullOrWhiteSpace(exe) && !string.IsNullOrWhiteSpace(expected) && !exe.Equals(expected,StringComparison.OrdinalIgnoreCase))
+                return "⚠ AHK 프로세스 확인 필요";
+            return "● AHK 실행 중";
+        }
+        catch{return "⚠ 프로세스 확인 필요";}
+    }
+
     void UpdateScriptDetails()
     {
         var s = Selected();
         if (s == null) { scriptDetails.Text = "스크립트를 선택하면 상세 정보가 표시됩니다."; return; }
-        string state = s.Pid.HasValue ? "● 실행 중" : (s.Enabled ? "○ 대기" : "× 비활성");
+        string state = GetScriptStateText(s);
         string targetMode = s.AutomaticTargetMonitoring ? "자동 연동 ON" : "수동";
         string targetOptions = $"시작 시 실행={(s.StartWhenTargetStarts ? "ON" : "OFF")} / 종료 시 종료={(s.StopWhenTargetExits ? "ON" : "OFF")}";
         string restart = s.AutoRestart ? $"자동 재실행 ON ({s.MaxRestarts}회/{s.RestartWindowSeconds}초, {s.RestartDelayMs}ms)" : "자동 재실행 OFF";
@@ -313,7 +343,7 @@ public sealed class MainForm : Form
             scripts.Items.Clear();
             foreach (var s in visible)
             {
-                var i = new ListViewItem(s.Pid.HasValue ? "● 실행" : (s.Enabled ? "○ 대기" : "× 비활성")) { Tag = s };
+                var i = new ListViewItem(GetScriptStateText(s)) { Tag = s };
                 i.SubItems.Add(s.Name); i.SubItems.Add(s.Group); i.SubItems.Add(s.Version); i.SubItems.Add(s.Pid?.ToString() ?? "-");
                 i.SubItems.Add(s.StartHotkey); i.SubItems.Add(s.StopHotkey); i.SubItems.Add(s.TargetProcess); i.SubItems.Add(s.Path);
                 if (s.Id.Equals(keepId,StringComparison.OrdinalIgnoreCase)) i.Selected = true;
@@ -383,6 +413,8 @@ public sealed class MainForm : Form
         if(exe==""){Log($"실행 실패: AHK 실행기 결정 불가 - {s.Name} / 버전을 명시하거나 AHK 실행 파일을 지정하세요.");MessageBox.Show($"{s.Name}\nAHK v1/v2를 자동으로 결정할 수 없습니다.\n스크립트 설정에서 버전 또는 AHK 실행 파일을 지정하세요.");return;}
         try
         {
+            string detectedVersion=DetectVersion(s.Path);
+            Log($"AHK 실행 준비: {s.Name} / 지정={s.Version} / 감지={detectedVersion} / 실행기={exe}");
             var psi=new ProcessStartInfo(exe){UseShellExecute=true,WorkingDirectory=Directory.Exists(s.WorkingDirectory)?s.WorkingDirectory:(Path.GetDirectoryName(s.Path)??"")};
             psi.ArgumentList.Add(s.Path);
             foreach(var arg in SplitArguments(s.Arguments)) psi.ArgumentList.Add(arg);
@@ -390,6 +422,15 @@ public sealed class MainForm : Form
             var p=Process.Start(psi);
             if(p!=null)
             {
+                try
+                {
+                    if(p.WaitForExit(300))
+                    {
+                        Log($"AHK가 시작 직후 종료됨: {s.Name} PID={p.Id} ExitCode={p.ExitCode} / 스크립트 오류 가능성");
+                        return;
+                    }
+                }
+                catch(Exception waitEx){Log($"AHK 시작 상태 확인 실패: {s.Name} / {waitEx.Message}");}
                 s.Pid=p.Id;
                 s.DesiredRunning=true;
                 s.ManualOverride=manual;
@@ -473,9 +514,15 @@ public sealed class MainForm : Form
     string ResolveAhk(ScriptItem s)
     {
         if(File.Exists(s.AhkExe))return s.AhkExe;
-        if(s.Version.Contains("v2",StringComparison.OrdinalIgnoreCase))
+        string version=s.Version;
+        if(version.Equals("Auto",StringComparison.OrdinalIgnoreCase) && File.Exists(s.Path))
+        {
+            var detected=DetectVersion(s.Path);
+            if(!detected.Equals("Auto",StringComparison.OrdinalIgnoreCase)) version=detected;
+        }
+        if(version.Contains("v2",StringComparison.OrdinalIgnoreCase))
             foreach(var p in new[]{cfg.AhkV2Path,@"C:\Program Files\AutoHotkey\v2\AutoHotkey.exe"})if(File.Exists(p))return p;
-        if(s.Version.Contains("v1",StringComparison.OrdinalIgnoreCase))
+        if(version.Contains("v1",StringComparison.OrdinalIgnoreCase))
             foreach(var p in new[]{cfg.AhkV1Path,@"C:\Program Files\AutoHotkey\AutoHotkey.exe",@"C:\Program Files\AutoHotkey\AutoHotkeyU64.exe",@"C:\Program Files (x86)\AutoHotkey\AutoHotkey.exe"})if(File.Exists(p))return p;
         var configured=new[]{cfg.AhkV1Path,cfg.AhkV2Path}.Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         if(configured.Count==1)return configured[0];
@@ -666,10 +713,55 @@ public sealed class MainForm : Form
     void ShowFromTray(){Show();WindowState=FormWindowState.Normal;Activate();}
     protected override void OnResize(EventArgs e){base.OnResize(e);if(WindowState==FormWindowState.Minimized&&cfg.MinimizeToTray)Hide();}
 
-    void RegisterAllHotkeys(){foreach(var id in hotkeys.Keys.ToList())UnregisterHotKey(Handle,id);hotkeys.Clear();nextHotkeyId=100;var used=new HashSet<string>(StringComparer.OrdinalIgnoreCase);foreach(var s in cfg.Scripts.Where(x=>x.Enabled)){TryRegister(s.StartHotkey,()=>RunScript(s),used,$"{s.Name} 시작");TryRegister(s.StopHotkey,()=>StopScript(s),used,$"{s.Name} 종료");}TryRegister(cfg.EmergencyStopHotkey,EmergencyStop,used,"긴급 전체 종료");foreach(var p in cfg.Profiles){TryRegister(p.StartHotkey,()=>RunProfileById(p.Id),used,$"프로필 {p.Name} 시작");TryRegister(p.StopHotkey,()=>StopProfileById(p.Id),used,$"프로필 {p.Name} 종료");}}
+    void RegisterAllHotkeys()
+    {
+        foreach(var id in hotkeys.Keys.ToList()) UnregisterHotKey(Handle,id);
+        hotkeys.Clear();
+        nextHotkeyId=100;
+        var used=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach(var s in cfg.Scripts.Where(x=>x.Enabled))
+        {
+            TryRegister(s.StartHotkey,()=>RunScript(s),used,$"{s.Name} 시작",s);
+            TryRegister(s.StopHotkey,()=>StopScript(s),used,$"{s.Name} 종료",s);
+        }
+
+        TryRegister(cfg.EmergencyStopHotkey,EmergencyStop,used,"긴급 전체 종료",null);
+        foreach(var p in cfg.Profiles)
+        {
+            TryRegister(p.StartHotkey,()=>RunProfileById(p.Id),used,$"프로필 {p.Name} 시작",null);
+            TryRegister(p.StopHotkey,()=>StopProfileById(p.Id),used,$"프로필 {p.Name} 종료",null);
+        }
+    }
+
     async void RunProfileById(string id){var p=cfg.Profiles.FirstOrDefault(x=>x.Id.Equals(id,StringComparison.OrdinalIgnoreCase));if(p==null)return;await RunProfileInternal(p);}
     async void StopProfileById(string id){var p=cfg.Profiles.FirstOrDefault(x=>x.Id.Equals(id,StringComparison.OrdinalIgnoreCase));if(p==null)return;await StopProfileInternal(p);}
-    void TryRegister(string text,Action action,HashSet<string> used,string owner){if(string.IsNullOrWhiteSpace(text))return;if(!ParseHotkey(text,out var mod,out var vk)){Log($"지원하지 않는 단축키: {text} / {owner}");return;}string key=$"{mod}:{vk}";if(!used.Add(key)){Log($"단축키 충돌: {text} / {owner}");return;}int id=nextHotkeyId++;if(RegisterHotKey(Handle,id,mod,vk))hotkeys[id]=action;else Log($"단축키 등록 실패: {text} / {owner}");}
+
+    void TryRegister(string text,Action action,HashSet<string> used,string owner,ScriptItem? script)
+    {
+        if(string.IsNullOrWhiteSpace(text))return;
+        if(!ParseHotkey(text,out var mod,out var vk))
+        {
+            Log($"지원하지 않는 단축키: {text} / {owner}. 예: Ctrl+F1, Ctrl+Numpad1, Ctrl+NumpadAdd, Ctrl+[ ");
+            return;
+        }
+        string key=$"{mod}:{vk}";
+        if(!used.Add(key)){Log($"단축키 충돌: {text} / {owner}");return;}
+        int id=nextHotkeyId++;
+        uint registerMod=mod|MOD_NOREPEAT;
+        if(RegisterHotKey(Handle,id,registerMod,vk))
+        {
+            hotkeys[id]=new HotkeyBinding{Action=action,Script=script,Owner=owner};
+            string scope=script==null||string.IsNullOrWhiteSpace(script.TargetProcess)?"전역":"대상 프로세스 전용: "+Path.GetFileName(script.TargetProcess);
+            Log($"단축키 등록: {text} / {owner} / {scope}");
+        }
+        else
+        {
+            int error=Marshal.GetLastWin32Error();
+            string reason=error==ERROR_HOTKEY_ALREADY_REGISTERED?"이미 다른 프로그램이 사용 중":$"Windows 오류 {error}";
+            Log($"단축키 등록 실패: {text} / {owner} / {reason}");
+        }
+    }
     bool ParseHotkey(string text, out uint mod, out uint vk)
     {
         mod = 0; vk = 0;
@@ -677,25 +769,39 @@ public sealed class MainForm : Form
         int keyCount = 0;
         foreach (var raw in parts)
         {
-            var p = raw.ToLowerInvariant();
+            var p = raw.Trim().ToLowerInvariant();
             switch (p)
             {
                 case "ctrl": case "control": mod |= MOD_CONTROL; continue;
                 case "alt": mod |= MOD_ALT; continue;
                 case "shift": mod |= MOD_SHIFT; continue;
-                case "win": case "windows": mod |= MOD_WIN; continue;
+                case "win": case "windows": case "lwin": case "rwin": mod |= MOD_WIN; continue;
             }
+
             if (keyCount++ > 0) return false;
             if (p.Length == 1 && char.IsLetterOrDigit(p[0])) { vk = char.ToUpperInvariant(p[0]); continue; }
             if (p.StartsWith("f") && int.TryParse(p[1..], out var n) && n >= 1 && n <= 24) { vk = (uint)(0x70 + n - 1); continue; }
-            if (p.StartsWith("num") && int.TryParse(p[3..], out var k) && k >= 0 && k <= 9) { vk = (uint)(0x60 + k); continue; }
+
             var map = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
             {
+                ["num0"] = 0x60, ["num1"] = 0x61, ["num2"] = 0x62, ["num3"] = 0x63, ["num4"] = 0x64,
+                ["num5"] = 0x65, ["num6"] = 0x66, ["num7"] = 0x67, ["num8"] = 0x68, ["num9"] = 0x69,
+                ["numpad0"] = 0x60, ["numpad1"] = 0x61, ["numpad2"] = 0x62, ["numpad3"] = 0x63, ["numpad4"] = 0x64,
+                ["numpad5"] = 0x65, ["numpad6"] = 0x66, ["numpad7"] = 0x67, ["numpad8"] = 0x68, ["numpad9"] = 0x69,
+                ["numadd"] = 0x6B, ["numpadadd"] = 0x6B, ["num+"] = 0x6B, ["numsub"] = 0x6D, ["numpadsub"] = 0x6D, ["num-"] = 0x6D,
+                ["nummult"] = 0x6A, ["numpadmultiply"] = 0x6A, ["numpadmult"] = 0x6A, ["num*"] = 0x6A,
+                ["numdiv"] = 0x6F, ["numpaddivide"] = 0x6F, ["num/"] = 0x6F, ["numdecimal"] = 0x6E, ["numpaddecimal"] = 0x6E,
+                ["numdel"] = 0x6E, ["numpaddecimalpoint"] = 0x6E, ["numsep"] = 0x6C,
                 ["pause"] = 0x13, ["space"] = 0x20, ["enter"] = 0x0D, ["esc"] = 0x1B, ["escape"] = 0x1B,
                 ["tab"] = 0x09, ["insert"] = 0x2D, ["delete"] = 0x2E, ["home"] = 0x24, ["end"] = 0x23,
-                ["pageup"] = 0x21, ["pagedown"] = 0x22, ["left"] = 0x25, ["up"] = 0x26,
-                ["right"] = 0x27, ["down"] = 0x28, ["backspace"] = 0x08, ["capslock"] = 0x14,
-                ["scrolllock"] = 0x91, ["numlock"] = 0x90, ["printscreen"] = 0x2C
+                ["pageup"] = 0x21, ["pgup"] = 0x21, ["pagedown"] = 0x22, ["pgdn"] = 0x22,
+                ["left"] = 0x25, ["up"] = 0x26, ["right"] = 0x27, ["down"] = 0x28, ["backspace"] = 0x08,
+                ["capslock"] = 0x14, ["scrolllock"] = 0x91, ["numlock"] = 0x90, ["printscreen"] = 0x2C, ["prtsc"] = 0x2C,
+                ["apps"] = 0x5D, ["menu"] = 0x5D, ["semicolon"] = 0xBA, [";"] = 0xBA, ["equals"] = 0xBB, ["="] = 0xBB,
+                ["comma"] = 0xBC, [","] = 0xBC, ["minus"] = 0xBD, ["-"] = 0xBD, ["period"] = 0xBE, ["."] = 0xBE,
+                ["slash"] = 0xBF, ["/"] = 0xBF, ["backquote"] = 0xC0, ["grave"] = 0xC0, ["`"] = 0xC0,
+                ["lbracket"] = 0xDB, ["["] = 0xDB, ["backslash"] = 0xDC, ["\"] = 0xDC, ["rbracket"] = 0xDD, ["]"] = 0xDD,
+                ["apostrophe"] = 0xDE, ["quote"] = 0xDE, ["'"] = 0xDE
             };
             if (map.TryGetValue(p, out var v)) { vk = v; continue; }
             return false;
@@ -703,7 +809,38 @@ public sealed class MainForm : Form
         return keyCount == 1 && vk != 0;
     }
 
-    protected override void WndProc(ref Message m){if(m.Msg==WM_HOTKEY&&hotkeys.TryGetValue(m.WParam.ToInt32(),out var a)){try{BeginInvoke(a);}catch{}}base.WndProc(ref m);}
+    protected override void WndProc(ref Message m)
+    {
+        if(m.Msg==WM_HOTKEY && hotkeys.TryGetValue(m.WParam.ToInt32(),out var binding))
+        {
+            if(binding.Script!=null && !IsTargetProcessForeground(binding.Script.TargetProcess))
+            {
+                Log($"단축키 무시: {binding.Owner} / 대상 프로세스가 포그라운드가 아님");
+            }
+            else
+            {
+                try{BeginInvoke(binding.Action);}catch{}
+            }
+        }
+        base.WndProc(ref m);
+    }
+
+    bool IsTargetProcessForeground(string targetProcess)
+    {
+        if(string.IsNullOrWhiteSpace(targetProcess)) return true;
+        var hwnd=GetForegroundWindow();
+        if(hwnd==IntPtr.Zero) return false;
+        if(GetWindowThreadProcessId(hwnd,out var pid)==0 || pid==0) return false;
+        try
+        {
+            using var p=Process.GetProcessById((int)pid);
+            string actual=p.ProcessName;
+            string configured=Path.GetFileNameWithoutExtension(targetProcess.Trim());
+            if(configured.Contains('\')) configured=Path.GetFileNameWithoutExtension(configured);
+            return actual.Equals(configured,StringComparison.OrdinalIgnoreCase);
+        }
+        catch{return false;}
+    }
 
     void UpdateStartup(){try{using var k=Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run",true);if(k==null)return;if(cfg.StartWithWindows)k.SetValue("AHKScriptManager",Application.ExecutablePath);else k.DeleteValue("AHKScriptManager",false);}catch(Exception ex){Log("시작프로그램 설정 실패: "+ex.Message);}}
     void LoadConfig(){
@@ -845,29 +982,176 @@ sealed class ProcessPickerForm : Form
 
 sealed class ScriptEditorForm : Form
 {
-    readonly ScriptItem s; readonly TextBox name=new(), start=new(), stop=new(), exe=new(), args=new(), work=new(), group=new(), target=new(); readonly TextBox desc=new(); readonly ComboBox version=new(); readonly CheckBox admin=new(), auto=new(), watch=new(), automaticTarget=new(), startTarget=new(), stopTarget=new(), enabled=new(); readonly NumericUpDown max=new(), delay=new(), window=new();
-    public ScriptEditorForm(ScriptItem item){s=item;Text="스크립트 설정 - "+s.Name;Width=760;Height=680;MinimumSize=new Size(620,500);StartPosition=FormStartPosition.CenterParent;AutoScaleMode=AutoScaleMode.Dpi;Build();}
-    void Build(){var t=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(12),ColumnCount=2,AutoScroll=true};t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,150));t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
-        Add(t,"이름",name,s.Name);Add(t,"AHK 버전",version);version.DropDownStyle=ComboBoxStyle.DropDownList;version.Items.AddRange(new object[]{"Auto","v1","v2"});version.SelectedItem=s.Version is "v1" or "v2"?s.Version:"Auto";Add(t,"그룹",group,s.Group);Add(t,"시작 단축키",start,s.StartHotkey);Add(t,"종료 단축키",stop,s.StopHotkey);
+    readonly ScriptItem s;
+    readonly TextBox name=new(), start=new(), stop=new(), exe=new(), args=new(), work=new(), group=new(), target=new();
+    readonly TextBox desc=new();
+    readonly ComboBox version=new();
+    readonly CheckBox admin=new(), auto=new(), watch=new(), automaticTarget=new(), startTarget=new(), stopTarget=new(), enabled=new();
+    readonly NumericUpDown max=new(), delay=new(), window=new();
+
+    public ScriptEditorForm(ScriptItem item)
+    {
+        s=item;
+        Text="스크립트 설정 - "+s.Name;
+        Width=760; Height=680; MinimumSize=new Size(620,500);
+        StartPosition=FormStartPosition.CenterParent; AutoScaleMode=AutoScaleMode.Dpi;
+        Build();
+        LoadFromModel();
+    }
+
+    void Build()
+    {
+        var t=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(12),ColumnCount=2,AutoScroll=true};
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,150));
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
+
+        Add(t,"이름",name);
+        Add(t,"AHK 버전",version);
+        version.DropDownStyle=ComboBoxStyle.DropDownList;
+        version.Items.AddRange(new object[]{"Auto","v1","v2"});
+        Add(t,"그룹",group);
+        Add(t,"시작 단축키",start);
+        Add(t,"종료 단축키",stop);
+
         t.Controls.Add(new Label{Text="AHK 실행 파일",AutoSize=true,Anchor=AnchorStyles.Left});
-        var exePanel=new FlowLayoutPanel{Dock=DockStyle.Fill,AutoSize=false,WrapContents=false,Margin=new Padding(0),Padding=new Padding(0)};
-        exe.Dock=DockStyle.Fill; exePanel.Controls.Add(exe);
-        var pickExe=new Button{Text="찾기",Width=70,Height=26,Margin=new Padding(6,0,0,0)}; exePanel.Controls.Add(pickExe); t.Controls.Add(exePanel);
-        pickExe.Click+=(a,b)=>{using var d=new OpenFileDialog{Title="AutoHotkey 실행 파일 선택",Filter="AutoHotkey 실행 파일 (*.exe)|*.exe|모든 파일 (*.*)|*.*",CheckFileExists=true};if(!string.IsNullOrWhiteSpace(exe.Text)&&File.Exists(exe.Text))d.FileName=exe.Text;if(d.ShowDialog(this)==DialogResult.OK)exe.Text=d.FileName;};
-        Add(t,"실행 인자",args,s.Arguments);Add(t,"작업 디렉터리",work,s.WorkingDirectory);
+        var exePanel=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=2,Margin=new Padding(0),Padding=new Padding(0)};
+        exePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
+        exePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,76));
+        exe.Dock=DockStyle.Fill;
+        exePanel.Controls.Add(exe,0,0);
+        var pickExe=new Button{Text="찾기",Dock=DockStyle.Fill,Margin=new Padding(6,0,0,0)};
+        exePanel.Controls.Add(pickExe,1,0);
+        t.Controls.Add(exePanel);
+        pickExe.Click+=(a,b)=>{
+            using var d=new OpenFileDialog{Title="AutoHotkey 실행 파일 선택",Filter="AutoHotkey 실행 파일 (*.exe)|*.exe|모든 파일 (*.*)|*.*",CheckFileExists=true};
+            if(!string.IsNullOrWhiteSpace(exe.Text)&&File.Exists(exe.Text)) d.FileName=exe.Text;
+            if(d.ShowDialog(this)==DialogResult.OK) exe.Text=d.FileName;
+        };
+
+        Add(t,"실행 인자",args);
+        Add(t,"작업 디렉터리",work);
+
         t.Controls.Add(new Label{Text="대상 프로세스",AutoSize=true,Anchor=AnchorStyles.Left});
-        var targetPanel=new FlowLayoutPanel{Dock=DockStyle.Fill,AutoSize=false,WrapContents=false,Margin=new Padding(0),Padding=new Padding(0)};
-        target.Width=300; targetPanel.Controls.Add(target);
-        var pickTarget=new Button{Text="프로세스 선택",Width=105,Height=26,Margin=new Padding(6,0,0,0)};
-        targetPanel.Controls.Add(pickTarget); t.Controls.Add(targetPanel);
+        var targetPanel=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=2,Margin=new Padding(0),Padding=new Padding(0)};
+        targetPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
+        targetPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,111));
+        target.Dock=DockStyle.Fill;
+        targetPanel.Controls.Add(target,0,0);
+        var pickTarget=new Button{Text="프로세스 선택",Dock=DockStyle.Fill,Margin=new Padding(6,0,0,0)};
+        targetPanel.Controls.Add(pickTarget,1,0);
+        t.Controls.Add(targetPanel);
         pickTarget.Click+=(a,b)=>{using var f=new ProcessPickerForm(target.Text);if(f.ShowDialog(this)==DialogResult.OK)target.Text=f.SelectedProcess;};
-        Add(t,"설명",desc,s.Description);desc.Multiline=true;desc.Height=70;
-        AddCheck(t,admin,"관리자 권한",s.RunAsAdmin);AddCheck(t,enabled,"활성화",s.Enabled);AddCheck(t,auto,"비정상 종료 자동 재실행",s.AutoRestart);AddCheck(t,watch,"파일 변경 시 자동 재시작",s.WatchFile);AddCheck(t,automaticTarget,"자동 프로세스 연동 사용",s.AutomaticTargetMonitoring);AddCheck(t,startTarget,"대상 프로세스 시작 시 실행",s.StartWhenTargetStarts);AddCheck(t,stopTarget,"대상 프로세스 종료 시 종료",s.StopWhenTargetExits); automaticTarget.CheckedChanged+=(a,b)=>{startTarget.Enabled=automaticTarget.Checked;stopTarget.Enabled=automaticTarget.Checked;};startTarget.Enabled=automaticTarget.Checked;stopTarget.Enabled=automaticTarget.Checked;target.Enabled=true;pickTarget.Enabled=true;
-        max.Maximum=100;max.Value=s.MaxRestarts;delay.Maximum=600000;delay.Value=s.RestartDelayMs;window.Maximum=86400;window.Minimum=1;window.Value=Math.Clamp(s.RestartWindowSeconds,1,86400);Add(t,"최대 재실행",max);Add(t,"재실행 지연(ms)",delay);Add(t,"재실행 제한 창(초)",window);
-        var ok=new Button{Text="저장",DialogResult=DialogResult.OK,Width=100};var cancel=new Button{Text="취소",DialogResult=DialogResult.Cancel,Width=100};var p=new FlowLayoutPanel{AutoSize=true};p.Controls.Add(ok);p.Controls.Add(cancel);t.Controls.Add(new Label());t.Controls.Add(p);Controls.Add(t);AcceptButton=ok;CancelButton=cancel;FormClosing+=(a,b)=>{if(DialogResult!=DialogResult.OK)return;s.Name=name.Text.Trim();s.Version=version.SelectedItem?.ToString()??"Auto";s.Group=group.Text.Trim();s.StartHotkey=start.Text.Trim();s.StopHotkey=stop.Text.Trim();s.AhkExe=exe.Text.Trim();s.Arguments=args.Text;s.WorkingDirectory=work.Text.Trim();s.TargetProcess=target.Text.Trim();s.Description=desc.Text;s.RunAsAdmin=admin.Checked;s.Enabled=enabled.Checked;s.AutoRestart=auto.Checked;s.WatchFile=watch.Checked;s.AutomaticTargetMonitoring=automaticTarget.Checked;s.StartWhenTargetStarts=startTarget.Checked;s.StopWhenTargetExits=stopTarget.Checked;s.MaxRestarts=(int)max.Value;s.RestartDelayMs=(int)delay.Value;s.RestartWindowSeconds=(int)window.Value;};}
-    void Add(TableLayoutPanel t,string label,Control c,string val=""){t.Controls.Add(new Label{Text=label,AutoSize=true,Anchor=AnchorStyles.Left});if(c is TextBox x)x.Text=val;t.Controls.Add(c);}
-    void Add(TableLayoutPanel t,string label,Control c){t.Controls.Add(new Label{Text=label,AutoSize=true,Anchor=AnchorStyles.Left});t.Controls.Add(c);}
-    void AddCheck(TableLayoutPanel t,CheckBox c,string text,bool value){c.Text=text;c.Checked=value;c.AutoSize=true;t.Controls.Add(new Label());t.Controls.Add(c);}
+
+        Add(t,"설명",desc);
+        desc.Multiline=true; desc.Height=70; desc.ScrollBars=ScrollBars.Vertical;
+
+        AddCheck(t,admin,"관리자 권한");
+        AddCheck(t,enabled,"활성화");
+        AddCheck(t,auto,"비정상 종료 자동 재실행");
+        AddCheck(t,watch,"파일 변경 시 자동 재시작");
+        AddCheck(t,automaticTarget,"자동 프로세스 연동 사용");
+        AddCheck(t,startTarget,"대상 프로세스 시작 시 실행");
+        AddCheck(t,stopTarget,"대상 프로세스 종료 시 종료");
+
+        automaticTarget.CheckedChanged+=(a,b)=>UpdateTargetOptions();
+
+        max.Maximum=100;
+        delay.Maximum=600000;
+        window.Minimum=1; window.Maximum=86400;
+        Add(t,"최대 재실행",max);
+        Add(t,"재실행 지연(ms)",delay);
+        Add(t,"재실행 제한 창(초)",window);
+
+        var ok=new Button{Text="저장",Width=100};
+        var cancel=new Button{Text="취소",DialogResult=DialogResult.Cancel,Width=100};
+        ok.Click+=(a,b)=>{
+            if(!SaveToModel()) return;
+            DialogResult=DialogResult.OK;
+            Close();
+        };
+        var p=new FlowLayoutPanel{AutoSize=true};
+        p.Controls.Add(ok); p.Controls.Add(cancel);
+        t.Controls.Add(new Label()); t.Controls.Add(p);
+        Controls.Add(t);
+        AcceptButton=ok;
+        CancelButton=cancel;
+    }
+
+    void LoadFromModel()
+    {
+        name.Text=s.Name ?? "";
+        version.SelectedItem=s.Version is "v1" or "v2" ? s.Version : "Auto";
+        group.Text=s.Group ?? "";
+        start.Text=s.StartHotkey ?? "";
+        stop.Text=s.StopHotkey ?? "";
+        exe.Text=s.AhkExe ?? "";
+        args.Text=s.Arguments ?? "";
+        work.Text=s.WorkingDirectory ?? "";
+        target.Text=s.TargetProcess ?? "";
+        desc.Text=s.Description ?? "";
+        admin.Checked=s.RunAsAdmin;
+        enabled.Checked=s.Enabled;
+        auto.Checked=s.AutoRestart;
+        watch.Checked=s.WatchFile;
+        automaticTarget.Checked=s.AutomaticTargetMonitoring;
+        startTarget.Checked=s.StartWhenTargetStarts;
+        stopTarget.Checked=s.StopWhenTargetExits;
+        max.Value=Math.Clamp(s.MaxRestarts,0,100);
+        delay.Value=Math.Clamp(s.RestartDelayMs,0,600000);
+        window.Value=Math.Clamp(s.RestartWindowSeconds,1,86400);
+        UpdateTargetOptions();
+    }
+
+    bool SaveToModel()
+    {
+        try
+        {
+            s.Name=name.Text.Trim();
+            s.Version=version.SelectedItem?.ToString() ?? "Auto";
+            s.Group=group.Text.Trim();
+            s.StartHotkey=start.Text.Trim();
+            s.StopHotkey=stop.Text.Trim();
+            s.AhkExe=exe.Text.Trim();
+            s.Arguments=args.Text;
+            s.WorkingDirectory=work.Text.Trim();
+            s.TargetProcess=target.Text.Trim();
+            s.Description=desc.Text;
+            s.RunAsAdmin=admin.Checked;
+            s.Enabled=enabled.Checked;
+            s.AutoRestart=auto.Checked;
+            s.WatchFile=watch.Checked;
+            s.AutomaticTargetMonitoring=automaticTarget.Checked;
+            s.StartWhenTargetStarts=startTarget.Checked;
+            s.StopWhenTargetExits=stopTarget.Checked;
+            s.MaxRestarts=(int)max.Value;
+            s.RestartDelayMs=(int)delay.Value;
+            s.RestartWindowSeconds=(int)window.Value;
+            return true;
+        }
+        catch(Exception ex)
+        {
+            MessageBox.Show(this,"설정 저장 중 오류가 발생했습니다.\n\n"+ex.Message,"저장 오류",MessageBoxButtons.OK,MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    void UpdateTargetOptions()
+    {
+        startTarget.Enabled=automaticTarget.Checked;
+        stopTarget.Enabled=automaticTarget.Checked;
+    }
+
+    void Add(TableLayoutPanel t,string label,Control c)
+    {
+        t.Controls.Add(new Label{Text=label,AutoSize=true,Anchor=AnchorStyles.Left});
+        t.Controls.Add(c);
+    }
+
+    void AddCheck(TableLayoutPanel t,CheckBox c,string text)
+    {
+        c.Text=text; c.AutoSize=true;
+        t.Controls.Add(new Label()); t.Controls.Add(c);
+    }
 }
 
 static class Program
